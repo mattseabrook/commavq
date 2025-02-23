@@ -4,8 +4,8 @@ import argparse
 import struct
 from pathlib import Path
 
-class AdaptiveArithmeticEncoder:
-    def __init__(self, alphabet_size=1024, precision=32):
+class DeltaArithmeticEncoder:
+    def __init__(self, precision=32):
         self.precision = precision
         self.full_range = 1 << precision
         self.half_range = self.full_range >> 1
@@ -14,13 +14,12 @@ class AdaptiveArithmeticEncoder:
         self.high = self.full_range - 1
         self.pending_bits = 0
         self.output_bits = []
-        self.alphabet_size = alphabet_size
-        self.freq = [1] * alphabet_size
-        self.total = alphabet_size  # Initial sum
+        self.freq = [1] * 2047  # -1023 to +1023 → 0-2046
+        self.total = 2047
 
     def _write_bit(self, bit):
         self.output_bits.append(bit)
-        while self.pending_bits > 0:
+        while self.pending_bits:
             self.output_bits.append(1 - bit)
             self.pending_bits -= 1
 
@@ -48,12 +47,19 @@ class AdaptiveArithmeticEncoder:
             else:
                 break
         
-        # Update frequency after encoding symbol
         self.freq[symbol] += 1
         self.total += 1
 
-    def encode_symbol(self, symbol):
-        self._update_range(symbol)
+    def encode_deltas(self, arr):
+        # Store first value as-is
+        self._update_range(arr[0])
+        # Encode deltas for remaining values
+        prev = arr[0]
+        for val in arr[1:]:
+            delta = val - prev
+            mapped = delta + 1023  # Convert to 0-2046
+            self._update_range(mapped)
+            prev = val
 
     def finish(self):
         self.pending_bits += 1
@@ -73,12 +79,15 @@ class AdaptiveArithmeticEncoder:
         return bytes_out
 
 def compress_tokens(tokens: np.ndarray) -> bytes:
-    tokens = tokens.reshape(1200, 8, 16).transpose(1, 2, 0).ravel()  # Optimized grouping
-    tokens = tokens.astype(np.int16)
+    # Reorganize: (1200,8,16) → (8,16,1200)
+    tokens = tokens.reshape(1200, 8, 16).transpose(1, 2, 0).ravel()
     
-    encoder = AdaptiveArithmeticEncoder()
-    for symbol in tokens:
-        encoder.encode_symbol(symbol)
+    encoder = DeltaArithmeticEncoder()
+    
+    # Process each spatial position's time series
+    for i in range(0, len(tokens), 1200):
+        chunk = tokens[i:i+1200]
+        encoder.encode_deltas(chunk)
     
     encoded_data = encoder.finish()
     return struct.pack("<I", tokens.size) + encoded_data

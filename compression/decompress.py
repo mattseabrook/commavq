@@ -4,8 +4,8 @@ import argparse
 import struct
 from pathlib import Path
 
-class AdaptiveArithmeticDecoder:
-    def __init__(self, bitstream, alphabet_size=1024, precision=32):
+class DeltaArithmeticDecoder:
+    def __init__(self, bitstream, precision=32):
         self.precision = precision
         self.full_range = 1 << precision
         self.half_range = self.full_range >> 1
@@ -15,18 +15,17 @@ class AdaptiveArithmeticDecoder:
         self.code = 0
         self.bitstream = bitstream
         self.bit_ptr = 0
-        self.alphabet_size = alphabet_size
-        self.freq = [1] * alphabet_size
-        self.total = alphabet_size
+        self.freq = [1] * 2047
+        self.total = 2047
         
         for _ in range(precision):
             self.code = (self.code << 1) | self._read_bit()
 
     def _read_bit(self):
-        if self.bit_ptr >= len(self.bitstream) * 8:
+        if self.bit_ptr >= len(self.bitstream)*8:
             return 0
-        byte = self.bitstream[self.bit_ptr // 8]
-        bit = (byte >> (self.bit_ptr % 8)) & 1
+        byte = self.bitstream[self.bit_ptr//8]
+        bit = (byte >> (self.bit_ptr%8)) & 1
         self.bit_ptr += 1
         return bit
 
@@ -37,7 +36,6 @@ class AdaptiveArithmeticDecoder:
         value = ((self.code - self.low + 1) * total - 1) // range_width
         symbol = np.searchsorted(cum_freq, value, side='right') - 1
         
-        # Update range
         self.high = self.low + (range_width * cum_freq[symbol+1] // total) - 1
         self.low = self.low + (range_width * cum_freq[symbol] // total)
         
@@ -59,19 +57,37 @@ class AdaptiveArithmeticDecoder:
             self.high = (self.high << 1) | 1
             self.code = (self.code << 1) | self._read_bit()
         
-        # Update frequency
         self.freq[symbol] += 1
         self.total += 1
         return symbol
 
-    def decode_stream(self, num_symbols):
-        return [self._decode_symbol() for _ in range(num_symbols)]
+    def decode_deltas(self, num_symbols):
+        output = []
+        # Decode first value
+        first_val = self._decode_symbol()
+        output.append(first_val)
+        # Decode deltas
+        prev = first_val
+        for _ in range(num_symbols-1):
+            mapped = self._decode_symbol()
+            delta = mapped - 1023
+            val = prev + delta
+            output.append(val)
+            prev = val
+        return output
 
 def decompress_bytes(data: bytes) -> np.ndarray:
     n = struct.unpack("<I", data[:4])[0]
-    decoder = AdaptiveArithmeticDecoder(data[4:])
-    tokens = np.array(decoder.decode_stream(n), dtype=np.int16)
-    tokens = tokens.reshape(8, 16, 1200).transpose(2, 0, 1)  # Reverse grouping
+    decoder = DeltaArithmeticDecoder(data[4:])
+    
+    tokens = []
+    # Each spatial position has 1200 tokens
+    for _ in range(0, n, 1200):
+        chunk = decoder.decode_deltas(1200)
+        tokens.extend(chunk)
+    
+    tokens = np.array(tokens, dtype=np.int16)
+    tokens = tokens.reshape(8, 16, 1200).transpose(2, 0, 1)
     return tokens.astype(np.int16)
 
 def main():
