@@ -17,7 +17,8 @@ if __name__ == '__main__':
   num_proc = multiprocessing.cpu_count()
   # load split 0 and 1
   splits = ['0', '1']
-  ds = load_dataset('commaai/commavq', num_proc=num_proc, split=splits)
+  data_files = {'0': 'data_0_to_2500.zip', '1': 'data_2500_to_5000.zip'}
+  ds = load_dataset('commaai/commavq', num_proc=num_proc, split=splits, data_files=data_files, trust_remote_code=True)
   ds = DatasetDict(zip(splits, ds))
   # compare
   ds.map(compare, desc="compare", num_proc=num_proc, load_from_cache_file=False)
