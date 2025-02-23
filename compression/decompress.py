@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+import os
 import numpy as np
-import argparse
 import struct
 from pathlib import Path
+import multiprocessing
+from datasets import DatasetDict, load_dataset
+
+HERE = Path(__file__).resolve().parent
+output_dir = Path(os.environ.get('OUTPUT_DIR', HERE/'./compression_challenge_submission_decompressed/'))
 
 class DeltaArithmeticDecoder:
+    # Keep our optimized decoder class
     def __init__(self, bitstream, precision=32):
         self.precision = precision
         self.full_range = 1 << precision
@@ -63,10 +69,8 @@ class DeltaArithmeticDecoder:
 
     def decode_deltas(self, num_symbols):
         output = []
-        # Decode first value
         first_val = self._decode_symbol()
         output.append(first_val)
-        # Decode deltas
         prev = first_val
         for _ in range(num_symbols-1):
             mapped = self._decode_symbol()
@@ -76,38 +80,29 @@ class DeltaArithmeticDecoder:
             prev = val
         return output
 
-def decompress_bytes(data: bytes) -> np.ndarray:
-    n = struct.unpack("<I", data[:4])[0]
-    decoder = DeltaArithmeticDecoder(data[4:])
+def decompress_bytes(x: bytes) -> np.ndarray:
+    n = struct.unpack("<I", x[:4])[0]
+    decoder = DeltaArithmeticDecoder(x[4:])
     
     tokens = []
-    # Each spatial position has 1200 tokens
     for _ in range(0, n, 1200):
         chunk = decoder.decode_deltas(1200)
         tokens.extend(chunk)
     
+    # Maintain original reshape order
     tokens = np.array(tokens, dtype=np.int16)
-    tokens = tokens.reshape(8, 16, 1200).transpose(2, 0, 1)
-    return tokens.astype(np.int16)
+    return tokens.reshape(128, -1).T.reshape(-1, 8, 16)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("compressed_file")
-    parser.add_argument("--output")
-    parser.add_argument("--verify", default=None)
-    args = parser.parse_args()
-    
-    with open(args.compressed_file, "rb") as f:
-        data = f.read()
-    
-    tokens = decompress_bytes(data)
-    output_path = Path(args.output or f"{args.compressed_file}.npy")
-    np.save(output_path, tokens)
-    
-    if args.verify:
-        orig = np.load(args.verify)
-        assert np.array_equal(orig, tokens), "Verification failed!"
-        print("Verification passed")
+def decompress_example(example):
+    path = Path(example['path'])
+    with open(output_dir/path.name, 'rb') as f:
+        tokens = decompress_bytes(f.read())
+    np.save(output_dir/path.name, tokens)
+    assert np.all(tokens == np.load(path)), f"Verification failed for {path}"
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    num_proc = multiprocessing.cpu_count()
+    splits = ['0', '1']
+    ds = load_dataset('commaai/commavq', num_proc=num_proc, split=splits)
+    ds = DatasetDict(zip(splits, ds))
+    ds.map(decompress_example, desc="decompress_example", num_proc=num_proc, load_from_cache_file=False)
