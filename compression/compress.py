@@ -1,48 +1,121 @@
 #!/usr/bin/env python3
 import os
-import lzma
-import multiprocessing
-import shutil
 import numpy as np
-
+import argparse
+import struct
 from pathlib import Path
-from datasets import load_dataset, DatasetDict
 
-HERE = Path(__file__).resolve().parent
+# ----------------- Arithmetic Coding Classes -----------------
+class ArithmeticEncoder:
+    def __init__(self, precision=32):
+        self.precision = precision
+        self.full_range = 1 << precision
+        self.half_range = self.full_range >> 1
+        self.quarter_range = self.full_range >> 2
+        self.low = 0
+        self.high = self.full_range - 1
+        self.pending_bits = 0
+        self.output_bits = []  # List of bits (0 or 1)
 
-output_dir = HERE / './compression_challenge_submission/'
+    def write_bit(self, bit):
+        self.output_bits.append(bit)
+        while self.pending_bits:
+            self.output_bits.append(1 - bit)
+            self.pending_bits -= 1
 
+    def encode_symbol(self, symbol, cum_freq, total):
+        range_width = self.high - self.low + 1
+        self.high = self.low + (range_width * cum_freq[symbol + 1] // total) - 1
+        self.low = self.low + (range_width * cum_freq[symbol] // total)
+        while True:
+            if self.high < self.half_range:
+                self.write_bit(0)
+                self.low <<= 1
+                self.high = (self.high << 1) | 1
+            elif self.low >= self.half_range:
+                self.write_bit(1)
+                self.low = (self.low - self.half_range) << 1
+                self.high = ((self.high - self.half_range) << 1) | 1
+            elif self.low >= self.quarter_range and self.high < 3 * self.quarter_range:
+                self.pending_bits += 1
+                self.low = (self.low - self.quarter_range) << 1
+                self.high = ((self.high - self.quarter_range) << 1) | 1
+            else:
+                break
+
+    def finish(self):
+        self.pending_bits += 1
+        if self.low < self.quarter_range:
+            self.write_bit(0)
+        else:
+            self.write_bit(1)
+        # Pack bits into bytes
+        out_bytes = bytearray()
+        current_byte = 0
+        bits_in_byte = 0
+        for bit in self.output_bits:
+            current_byte |= (bit << bits_in_byte)
+            bits_in_byte += 1
+            if bits_in_byte == 8:
+                out_bytes.append(current_byte)
+                current_byte = 0
+                bits_in_byte = 0
+        if bits_in_byte:
+            out_bytes.append(current_byte)
+        return bytes(out_bytes)
+
+# ----------------- Compression Pipeline -----------------
 def compress_tokens(tokens: np.ndarray) -> bytes:
-  tokens = tokens.astype(np.int16).reshape(-1, 128).T.ravel().tobytes() # transposing increases compression rate ;)
-  return lzma.compress(tokens)
+    # Reorder tokens: (1200,8,16) -> reshape to (1200,128) -> transpose to (128,1200) -> flatten.
+    tokens = tokens.astype(np.int16).reshape(1200, 128).T.ravel()
+    n = tokens.shape[0]  # should be 153600 tokens
 
-def compress_example(example):
-  path = Path(example['path'])
-  tokens = np.load(path)
-  compressed = compress_tokens(tokens)
-  compression_rate = (tokens.size * 10 / 8) / len(compressed) # 10 bits per token
-  with open(output_dir/path.name, 'wb') as f:
-    f.write(compressed)
-  example['compression_rate'] = compression_rate
-  return example
+    # Build frequency table (alphabet: 0..1023) with add-one smoothing.
+    alphabet_size = 1024
+    freq = [1] * alphabet_size
+    for token in tokens:
+        freq[int(token)] += 1
+    total = sum(freq)
+    cum_freq = [0]
+    for f in freq:
+        cum_freq.append(cum_freq[-1] + f)
 
-if __name__ == '__main__':
-  os.makedirs(output_dir, exist_ok=True)
-  num_proc = multiprocessing.cpu_count()
+    encoder = ArithmeticEncoder(precision=32)
+    for token in tokens:
+        encoder.encode_symbol(int(token), cum_freq, total)
+    encoded_bits = encoder.finish()
 
-  # load split 0 and 1
-  splits = ['0', '1']
-  data_files = {'0': 'data_0_to_2500.zip', '1': 'data_2500_to_5000.zip'} # force huggingface datasets to only download these files
-  ds = load_dataset('commaai/commavq', num_proc=num_proc, split=splits, data_files=data_files)
-  ds = DatasetDict(zip(splits, ds))
+    # Build header:
+    # 1. 4 bytes: number of tokens (unsigned int)
+    # 2. Frequency table: 1024 unsigned ints (4 bytes each)
+    header = bytearray()
+    header += struct.pack("<I", n)
+    for f in freq:
+        header += struct.pack("<I", f)
 
-  # compress
-  ratios = ds.map(compress_example, desc="compress_example", num_proc=num_proc, load_from_cache_file=False)
+    return bytes(header) + encoded_bits
 
-  # make archive
-  shutil.copy(HERE/'decompress.py', output_dir)
-  shutil.make_archive(HERE/'compression_challenge_submission', 'zip', output_dir)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compress a .npy file using arithmetic coding on transposed tokens (no delta)."
+    )
+    parser.add_argument("input_file", help="Path to the input .npy file")
+    parser.add_argument("output_file", nargs="?", help="Output file (default: input_file + .ac)")
+    args = parser.parse_args()
+    input_path = Path(args.input_file)
+    if args.output_file:
+        output_path = Path(args.output_file)
+    else:
+        output_path = input_path.with_suffix(input_path.suffix + ".ac")
+    tokens = np.load(input_path)
+    compressed = compress_tokens(tokens)
+    with open(output_path, "wb") as f:
+        f.write(compressed)
+    # Compression ratio is calculated based on original size (10 bits per token).
+    original_bits = tokens.size * 10
+    ratio = original_bits / (len(compressed) * 8)
+    print(f"Compression ratio: {ratio:.2f}")
+    print(f"Compressed file saved to: {output_path}")
 
-  # print compression rate
-  rate = (sum(ds.num_rows.values()) * 1200 * 128 * 10 / 8) / os.path.getsize(HERE/"compression_challenge_submission.zip")
-  print(f"Compression rate: {rate:.1f}")
+if __name__ == "__main__":
+    main()
