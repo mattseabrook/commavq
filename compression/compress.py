@@ -4,9 +4,10 @@ import lzma
 import multiprocessing
 import shutil
 import numpy as np
-
+from zipfile import ZipFile, ZIP_DEFLATED
 from pathlib import Path
 from datasets import load_dataset, DatasetDict
+from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent
 
@@ -31,11 +32,22 @@ def compress_example(example):
     return example
 
 
+def create_zip_with_progress(source_dir, output_path):
+    total_size = sum(f.stat().st_size for f in source_dir.glob("**/*") if f.is_file())
+    with ZipFile(output_path, "w", ZIP_DEFLATED) as zipf:
+        with tqdm(total=total_size, unit="B", unit_scale=True, desc="Zipping") as pbar:
+            for file_path in source_dir.glob("**/*"):
+                if file_path.is_file():
+                    arcname = file_path.relative_to(source_dir)
+                    zipf.write(file_path, arcname)
+                    pbar.update(file_path.stat().st_size)
+
+
 if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     num_proc = multiprocessing.cpu_count()
 
-    # load split 0 and 1
+    # Load split 0 and 1
     splits = ["0", "1"]
     data_files = {
         "0": str(HERE.parent / "data" / "data_0_to_2500.zip"),
@@ -46,20 +58,19 @@ if __name__ == "__main__":
     )
     ds = DatasetDict(zip(splits, ds))
 
-    # compress
+    # Compress with built-in progress bar
     ratios = ds.map(
         compress_example,
-        desc="compress_example",
+        desc="Compressing",
         num_proc=num_proc,
         load_from_cache_file=False,
     )
 
-    # make archive
+    # Make archive with progress
     shutil.copy(HERE / "decompress.py", output_dir)
-    shutil.make_archive(HERE / "compression_challenge_submission", "zip", output_dir)
+    zip_path = HERE / "compression_challenge_submission.zip"
+    create_zip_with_progress(output_dir, zip_path)
 
-    # print compression rate
-    rate = (sum(ds.num_rows.values()) * 1200 * 128 * 10 / 8) / os.path.getsize(
-        HERE / "compression_challenge_submission.zip"
-    )
+    # Print compression rate
+    rate = (sum(ds.num_rows.values()) * 1200 * 128 * 10 / 8) / os.path.getsize(zip_path)
     print(f"Compression rate: {rate:.1f}")
