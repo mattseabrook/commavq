@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os
-import lzma
+import zstandard as zstd
 import numpy as np
 from pathlib import Path
 import multiprocessing
@@ -15,7 +15,9 @@ output_dir = Path(
 
 
 def decompress_bytes(x: bytes) -> np.ndarray:
-    tokens = np.frombuffer(lzma.decompress(x), dtype=np.int16)
+    dctx = zstd.ZstdDecompressor()
+    decompressed_data = dctx.decompress(x)
+    tokens = np.frombuffer(decompressed_data, dtype=np.int16)
     return tokens.reshape(128, -1).T.reshape(-1, 8, 16)
 
 

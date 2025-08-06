@@ -4,8 +4,9 @@ import lzma
 import multiprocessing
 import shutil
 import numpy as np
-from zipfile import ZipFile, ZIP_STORED  # Changed to ZIP_STORED
-from concurrent.futures import ThreadPoolExecutor  # For parallelism
+import cupy as cp  # Import CuPy for GPU acceleration
+from zipfile import ZipFile, ZIP_STORED
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datasets import load_dataset, DatasetDict
 from tqdm import tqdm
@@ -14,9 +15,26 @@ HERE = Path(__file__).resolve().parent
 output_dir = HERE / "./compression_challenge_submission/"
 
 
+def delta_encode(tokens_gpu: cp.ndarray) -> cp.ndarray:
+    """Encodes tokens using delta encoding on GPU."""
+    return cp.diff(tokens_gpu.astype(cp.int32), prepend=0).astype(cp.int16)
+
+
 def compress_tokens(tokens: np.ndarray) -> bytes:
-    tokens = tokens.astype(np.int16).reshape(-1, 128).T.ravel().tobytes()
-    return lzma.compress(tokens)
+    """Delta-encodes and compresses tokens using LZMA with max settings."""
+    # Move data to GPU
+    tokens_gpu = cp.asarray(tokens.astype(cp.int16))
+    tokens_raveled_gpu = tokens_gpu.reshape(-1, 128).T.ravel()
+    encoded_tokens_gpu = delta_encode(tokens_raveled_gpu)
+
+    # Move back to CPU for LZMA compression
+    encoded_tokens = cp.asnumpy(encoded_tokens_gpu)
+
+    # Compress with LZMA at max settings (preset=9)
+    compressor = lzma.LZMACompressor(preset=9)
+    compressed = compressor.compress(encoded_tokens.tobytes())
+    compressed += compressor.flush()
+    return compressed
 
 
 def compress_example(example):
@@ -72,7 +90,7 @@ if __name__ == "__main__":
     )
     ds = DatasetDict(zip(splits, ds))
 
-    # Compress files with progress
+    # Compress files with progress using LZMA
     ratios = ds.map(
         compress_example,
         desc="Compressing",
