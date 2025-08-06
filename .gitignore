@@ -1,4 +1,5 @@
 *.zip
+*.tar.gz
 compression/compression_challenge_submission
 compression/compression_challenge_submission_decompressed/
 
