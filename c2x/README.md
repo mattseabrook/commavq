@@ -5,6 +5,7 @@
   - [Token Format](#token-format)
 - [Encoding](#encoding)
   - [Header Handling](#header-handling)
+  - [Bitpacking](#bitpacking)
   - [Keyframe](#keyframe)
   - [Delta Frames](#delta-frames)
     - [Mask-Based Encoding](#mask-based-encoding)
@@ -14,7 +15,7 @@
   - [`-v`](#-v)
 - [Visualization](#visualization)
 - [Developers](#developers)
-  - [Build Process](#build-process)
+  - [Examples](#examples)
   - [Windows SDK on Linux](#windows-sdk-on-linux)
 
 # Architecture
@@ -35,6 +36,13 @@ Temporal redundancy exploits between consecutive frames, where many tokens remai
 ## Header Handling
 
 The 128-byte NumPy header is identical across all files and hardcoded as a static array. It is skipped during compression and prepended during decompression.
+
+## Bitpacking
+
+Before delta encoding, each frame's 128 tokens (256 bytes) are packed by extracting the lower 10 bits and concatenating them into 160 bytes (128 * 10 / 8). This removes the 6-bit padding per token, reducing the frame size by 37.5% upfront.
+
+- **Process**: Loop over int16 tokens, mask & shift lower 10 bits, pack into uint8_t buffer (bit-by-bit accumulation).
+- **Notes**: Packing is lossless since upper bits are always zero. Total unpacked data: 307,200 bytes → packed: 192,000 bytes before deltas.
 
 ## Keyframe
 
@@ -88,14 +96,20 @@ The tool validates file size/extension, skips the header, and uses Uint8Array/Da
 
 # Developers
 
-## Build Process
+`build.sh` is a Bash script for compiling the C source on Linux, producing either a Windows x64 EXE (using `clang-cl` for MSVC compatibility) or a Linux x64 ELF executable.
 
-`build.sh` is a Bash script for cross-compiling the C source to a Windows x64 EXE on Linux, using `clang-cl` for MSVC compatibility.
+- **Dependencies**: Requires `xwin` for Windows SDK setup (auto-installs if missing for Windows builds). Uses `clang-cl`/`lld-link` for Windows, native `clang`/`ld` for Linux.
+- **Modes**: windows (cross-compile to commavq.exe), linux (native compile to commavq), clean (remove artifacts).
+- **Steps**: Detects SDK paths (for Windows), compiles .c files in src/ to .obj/o, links with platform libs. No external libraries; bare-metal C. Outputs ~10-20KB executable.
+- **Notes**: Wildcard support for src/*.c and include/; automatic platform config. For Windows: Uses MSVC runtime libs (libcmt, libucrt). For Linux: Optimized with -O3, -march=native.
 
-**Dependencies**: Requires `xwin` for Windows SDK setup (auto-installs if missing).
-- **Modes**: release (default, optimized), debug (symbols), clean (remove artifacts).
-- **Steps**: Detects SDK paths, compiles .c files in src/ to .obj, links with MSVC libs.
-- **Notes**: No external libraries; bare-metal C. Outputs commavq.exe (~10-20KB).
+## Examples 
+
+```bash
+./build.sh windows   # Build Windows version
+./build.sh linux     # Build Linux version
+./build.sh clean     # Clean all builds
+```
 
 ## Windows SDK on Linux
 

@@ -152,11 +152,11 @@ build_linux() {
         -funroll-loops \
         -fomit-frame-pointer \
         -DNDEBUG \
-        -static \
         -s \
         "${OBJECTS[@]}" \
         -o "$EXE_NAME" \
-        -lm
+        -lm \
+        -lpthread
     set +x  # Disable command tracing
 
     if [[ $? -eq 0 ]]; then
@@ -238,6 +238,7 @@ build_windows() {
         ole32.lib
         uuid.lib
         advapi32.lib
+        synchronization.lib
     )
 
     clang-cl --target="$TARGET_TRIPLE" -fuse-ld=lld-link \
