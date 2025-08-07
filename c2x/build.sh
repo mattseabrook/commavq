@@ -2,19 +2,47 @@
 #
 # build.sh – commavq CLI utility
 #
-# Cross-compiles src/*.c → Windows x64 EXE (MSVC runtime)
+# Cross-compiles src/*.c → Windows x64 EXE (MSVC runtime) OR Linux x64 ELF
 #
 
 set -e
+
+# Show banner
+echo -e "\033[1;97m                         _____ _____ 
+ ___ ___ _____ _____ ___|  |  |     |
+|  _| . |     |     | .'|  |  |  |  |
+|___|___|_|_|_|_|_|_|__,|\___/|__  _|
+                                 |__|
+\e[0m"
+echo 'commaVQ VQ-VAE Experimental post-processor'
+echo 'v.0.1 - 2025/08/07 - matt@lakeshoretechnical.com'
+echo
 
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
 PROJECT_ROOT=$(pwd)
-TARGET_TRIPLE="x86_64-pc-windows-msvc"
-WINSDK_BASE="/opt/winsdk"
 BUILD_DIR="build"
-EXE_NAME="commavq.exe"
+
+# Platform-specific configuration
+setup_platform_config() {
+    case "$1" in
+        windows)
+            TARGET_TRIPLE="x86_64-pc-windows-msvc"
+            WINSDK_BASE="/opt/winsdk"
+            EXE_NAME="commavq.exe"
+            ;;
+        linux)
+            TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+            EXE_NAME="commavq"
+            ;;
+        *)
+            echo "ERROR: Unknown platform '$1'"
+            echo "Supported platforms: windows, linux"
+            exit 1
+            ;;
+    esac
+}
 
 # ------------------------------------------------------------------------------
 # Windows-SDK helper
@@ -57,15 +85,98 @@ setup_winsdk() {
 # Clean build artifacts
 # ------------------------------------------------------------------------------
 clean() {
-    echo "=== Cleaning build artifacts ==="
-    rm -rf "$BUILD_DIR" "$EXE_NAME"
-    echo "Clean complete."
+    echo "Cleaning build artifacts..."
+    rm -rf "$BUILD_DIR" "commavq.exe" "commavq"
+    echo "  ✓ Cleaned successfully"
 }
 
 # ------------------------------------------------------------------------------
-# Main build process
+# Linux build process
 # ------------------------------------------------------------------------------
-build() {
+build_linux() {
+    echo "=== Building for Linux x64 ===
+    "
+
+    echo "Preparing build directory..."
+    mkdir -p "$BUILD_DIR"
+
+    echo "Compiling sources..."
+    OBJECTS=()
+    for src in src/*.c; do
+        [[ -f "$src" ]] || { echo "No source files found in src/"; exit 1; }
+        obj="$BUILD_DIR/$(basename "${src%.c}").o"
+        OBJECTS+=("$obj")
+        echo "$(basename "$src")..."
+        echo "  Source: $src"
+        echo "  Object: $obj"
+        
+        echo "Attempting compilation..."
+        set -x  # Enable command tracing
+        clang \
+            -std=c2x \
+            -O3 \
+            -march=native \
+            -mtune=native \
+            -flto \
+            -ffast-math \
+            -funroll-loops \
+            -fomit-frame-pointer \
+            -DNDEBUG \
+            -Wall \
+            -Wextra \
+            -Wpedantic \
+            -I"$PROJECT_ROOT/include" \
+            -c \
+            -o "$obj" \
+            "$src"
+        set +x  # Disable command tracing
+        
+        if [[ ! -f "$obj" ]]; then
+            echo "ERROR: Failed to compile $src"
+            exit 1
+        fi
+        echo "  ✓ Compiled successfully"
+    done
+
+    echo "Linking $EXE_NAME..."
+    echo "Object files to link: ${OBJECTS[*]}"
+
+    set -x  # Enable command tracing
+    clang \
+        -std=c2x \
+        -O3 \
+        -march=native \
+        -mtune=native \
+        -flto \
+        -ffast-math \
+        -funroll-loops \
+        -fomit-frame-pointer \
+        -DNDEBUG \
+        -static \
+        -s \
+        "${OBJECTS[@]}" \
+        -o "$EXE_NAME" \
+        -lm
+    set +x  # Disable command tracing
+
+    if [[ $? -eq 0 ]]; then
+        echo "✅ Build complete → ./$EXE_NAME"
+        if [[ -f "$EXE_NAME" ]]; then
+            file_size=$(stat -c%s "$EXE_NAME" 2>/dev/null || stat -f%z "$EXE_NAME" 2>/dev/null || echo "unknown")
+            echo "Executable size: ${file_size} bytes"
+        fi
+    else
+        echo "❌ Build failed!"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Windows build process  
+# ------------------------------------------------------------------------------
+build_windows() {
+    echo "=== Building for Windows x64 ==="
+    
     setup_winsdk
 
     echo "=== Preparing build directory ==="
@@ -144,18 +255,39 @@ build() {
     fi
 }
 
-# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------s
 # Script entry point
 # ------------------------------------------------------------------------------
-case "${1:-release}" in
+case "${1:-}" in
     clean)
         clean
         ;;
+    windows)
+        setup_platform_config windows
+        build_windows
+        ;;
+    linux)
+        setup_platform_config linux
+        build_linux
+        ;;
     debug|release)
-        build
+        # Backwards compatibility - default to Windows build
+        echo "⚠️  Warning: 'debug/release' is deprecated. Use 'windows' or 'linux' instead."
+        setup_platform_config windows
+        build_windows
         ;;
     *)
-        echo "Usage: $0 [clean|debug|release]"
+        echo "Usage: $0 [clean|windows|linux]"
+        echo ""
+        echo "Build targets:"
+        echo "  windows  - Cross-compile for Windows x64 (MSVC runtime) → commavq.exe"
+        echo "  linux    - Build for Linux x64 with intense optimizations → commavq"
+        echo "  clean    - Remove all build artifacts"
+        echo ""
+        echo "Examples:"
+        echo "  $0 windows   # Build Windows version"
+        echo "  $0 linux     # Build Linux version" 
+        echo "  $0 clean     # Clean all builds"
         exit 1
         ;;
 esac
