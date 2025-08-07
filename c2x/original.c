@@ -7,21 +7,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define VERSION "v0.1-bitpack-fixed"
+#define VERSION "v0.1"
 
+//
 // Constants based on file format
+//
 #define HEADER_SIZE 128
-#define TOKENS_PER_FRAME 128 // 8x16
-#define BITS_PER_TOKEN 10
-#define FRAME_SIZE 256                                            // Original unpacked bytes
-#define PACKED_FRAME_SIZE (TOKENS_PER_FRAME * BITS_PER_TOKEN / 8) // 160
+#define FRAME_SIZE 256
 #define NUM_FRAMES 1200
-#define TOTAL_DATA_SIZE (NUM_FRAMES * FRAME_SIZE)               // 307200
-#define PACKED_TOTAL_DATA_SIZE (NUM_FRAMES * PACKED_FRAME_SIZE) // 192000
+#define TOTAL_DATA_SIZE (NUM_FRAMES * FRAME_SIZE)
 #define TOTAL_FILE_SIZE (HEADER_SIZE + TOTAL_DATA_SIZE)
-#define MASK_SIZE (PACKED_FRAME_SIZE / 8) // 20
+#define MASK_SIZE (FRAME_SIZE / 8)
 
+//
 // Static NumPy header bytes
+//
 static const uint8_t numpy_header[HEADER_SIZE] = {
     0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59, 0x01, 0x00, 0x76, 0x00, 0x7B, 0x27, 0x64, 0x65, 0x73, 0x63,
     0x72, 0x27, 0x3A, 0x20, 0x27, 0x3C, 0x69, 0x32, 0x27, 0x2C, 0x20, 0x27, 0x66, 0x6F, 0x72, 0x74,
@@ -39,8 +39,6 @@ void print_usage(const char *prog_name);
 int compress_file(const char *input_path, const char *output_path);
 int decompress_file(const char *input_path, const char *output_path);
 void print_version(void);
-void pack_frame(const uint8_t *in_bytes, uint8_t *out_packed);
-void unpack_frame(const uint8_t *in_packed, uint8_t *out_bytes);
 
 ////////////////////////////////////////////////////////////////////////
 // UTILITY FUNCTIONS
@@ -53,7 +51,7 @@ void print_usage(const char *prog_name)
 {
     fprintf(stderr, "Usage: %s [option] [file]\n", prog_name);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -c <file>  Compress (bitpack + delta encode) the .token.npy file\n");
+    fprintf(stderr, "  -c <file>  Compress (delta encode) the .token.npy file\n");
     fprintf(stderr, "  -d <file>  Decompress the .token.npy.cmp file\n");
     fprintf(stderr, "  -v         Print version\n");
 }
@@ -68,99 +66,17 @@ void print_version(void)
 
 /*
 ===============================================================================
-Function Name: pack_frame
-
-Description:
-    - Packs a 256-byte frame (128 x 16-bit tokens) into 160 bytes by extracting
-      the lower 10 bits of each token (little-endian) and bit-packing them densely.
-
-Parameters:
-    - in_bytes: Pointer to 256 input bytes (original frame).
-    - out_packed: Pointer to 160 output bytes (packed frame).
-
-Return:
-    - None (void).
-===============================================================================
-*/
-void pack_frame(const uint8_t *in_bytes, uint8_t *out_packed)
-{
-    memset(out_packed, 0, PACKED_FRAME_SIZE);
-    int bit_pos = 0;
-    for (int t = 0; t < TOKENS_PER_FRAME; ++t)
-    {
-        uint16_t val = in_bytes[2 * t] | (in_bytes[2 * t + 1] << 8);
-        val &= 0x3FF; // Mask to 10 bits (assumes values <= 1023)
-        int byte_idx = bit_pos / 8;
-        int bit_off = bit_pos % 8;
-        out_packed[byte_idx] |= (val << bit_off) & 0xFF;
-        out_packed[byte_idx + 1] |= (val >> (8 - bit_off)) & 0xFF;
-        if (bit_off > 6) // If spans 3 bytes
-            out_packed[byte_idx + 2] |= (val >> (16 - bit_off)) & 0xFF;
-        bit_pos += BITS_PER_TOKEN;
-    }
-}
-
-/*
-===============================================================================
-Function Name: unpack_frame
-
-Description:
-    - Unpacks a 160-byte packed frame back into 256 bytes (128 x 16-bit tokens),
-      restoring the original little-endian byte format with high 6 bits zeroed.
-      Uses a precise bit-extraction loop to avoid over-grabbing bits from neighbors.
-
-Parameters:
-    - in_packed: Pointer to 160 input bytes (packed frame).
-    - out_bytes: Pointer to 256 output bytes (unpacked frame).
-
-Return:
-    - None (void).
-===============================================================================
-*/
-void unpack_frame(const uint8_t *in_packed, uint8_t *out_bytes)
-{
-    int bit_pos = 0;
-    for (int t = 0; t < TOKENS_PER_FRAME; ++t)
-    {
-        int byte_idx = bit_pos / 8;
-        int bit_off = bit_pos % 8;
-        uint32_t bits = 0;
-        int shift = 0;
-        int remaining = BITS_PER_TOKEN;
-        int current_byte_idx = byte_idx;
-        int current_bit_off = bit_off;
-        while (remaining > 0)
-        {
-            int take = (8 - current_bit_off < remaining) ? 8 - current_bit_off : remaining;
-            uint8_t byte = in_packed[current_byte_idx];
-            uint32_t part = (byte >> current_bit_off) & ((1u << take) - 1);
-            bits |= (part << shift);
-            shift += take;
-            remaining -= take;
-            current_bit_off = 0;
-            current_byte_idx++;
-        }
-        uint16_t val = bits & 0x3FF;     // Ensure only 10 bits
-        out_bytes[2 * t] = val & 0xFF;   // Low byte
-        out_bytes[2 * t + 1] = val >> 8; // High byte (0-3)
-        bit_pos += BITS_PER_TOKEN;
-    }
-}
-
-/*
-===============================================================================
 Function Name: compress_file
 
 Description:
-    - Compresses the input file: Bit packs each frame (256 -> 160 bytes),
-      then delta encodes the packed frames.
+    - Compresses the input VDX file and writes the compressed data to the output file.
 
 Parameters:
-    - input_path: The path to the input .token.npy file.
+    - input_path: The path to the input VDX file.
     - output_path: The path to the output compressed file.
 
 Return:
-    - 0 on success, or EXIT_FAILURE on failure.
+    - 0 on success, or a negative error code on failure.
 ===============================================================================
 */
 int compress_file(const char *input_path, const char *output_path)
@@ -204,50 +120,36 @@ int compress_file(const char *input_path, const char *output_path)
     }
     fclose(in_fp);
 
-    // Bit pack all frames
-    uint8_t *packed_data = malloc(PACKED_TOTAL_DATA_SIZE);
-    if (!packed_data)
-    {
-        perror("Failed to allocate packed memory");
-        free(data);
-        return EXIT_FAILURE;
-    }
-    for (int f = 0; f < NUM_FRAMES; ++f)
-    {
-        pack_frame(data + f * FRAME_SIZE, packed_data + f * PACKED_FRAME_SIZE);
-    }
-    free(data); // No longer needed
-
     // Open output file
     FILE *out_fp = fopen(output_path, "wb");
     if (!out_fp)
     {
         perror("Failed to open output file");
-        free(packed_data);
+        free(data);
         return EXIT_FAILURE;
     }
 
-    // Write keyframe (first packed frame, full 160 bytes)
-    if (fwrite(packed_data, 1, PACKED_FRAME_SIZE, out_fp) != PACKED_FRAME_SIZE)
+    // Write keyframe (first frame, full 256 bytes, no header)
+    if (fwrite(data, 1, FRAME_SIZE, out_fp) != FRAME_SIZE)
     {
         perror("Failed to write keyframe");
-        free(packed_data);
+        free(data);
         fclose(out_fp);
         return EXIT_FAILURE;
     }
 
-    // Process delta frames on packed data
-    uint8_t prev_frame[PACKED_FRAME_SIZE];
-    memcpy(prev_frame, packed_data, PACKED_FRAME_SIZE);
+    // Process delta frames
+    uint8_t prev_frame[FRAME_SIZE];
+    memcpy(prev_frame, data, FRAME_SIZE);
 
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
-        uint8_t *curr_frame = packed_data + f * PACKED_FRAME_SIZE;
-        uint8_t mask[MASK_SIZE] = {0}; // Bitmask for changes (20 bytes)
-        uint8_t changed_bytes[PACKED_FRAME_SIZE];
+        uint8_t *curr_frame = data + f * FRAME_SIZE;
+        uint8_t mask[MASK_SIZE] = {0}; // Bitmask for changes (32 bytes)
+        uint8_t changed_bytes[FRAME_SIZE];
         int changed_count = 0;
 
-        for (int i = 0; i < PACKED_FRAME_SIZE; ++i)
+        for (int i = 0; i < FRAME_SIZE; ++i)
         {
             if (curr_frame[i] != prev_frame[i])
             {
@@ -256,11 +158,11 @@ int compress_file(const char *input_path, const char *output_path)
             }
         }
 
-        // Write mask (20 bytes)
+        // Write mask (32 bytes)
         if (fwrite(mask, 1, MASK_SIZE, out_fp) != MASK_SIZE)
         {
             perror("Failed to write mask");
-            free(packed_data);
+            free(data);
             fclose(out_fp);
             return EXIT_FAILURE;
         }
@@ -269,16 +171,16 @@ int compress_file(const char *input_path, const char *output_path)
         if (fwrite(changed_bytes, 1, changed_count, out_fp) != (size_t)changed_count)
         {
             perror("Failed to write changed bytes");
-            free(packed_data);
+            free(data);
             fclose(out_fp);
             return EXIT_FAILURE;
         }
 
         // Update previous frame for next iteration
-        memcpy(prev_frame, curr_frame, PACKED_FRAME_SIZE);
+        memcpy(prev_frame, curr_frame, FRAME_SIZE);
     }
 
-    free(packed_data);
+    free(data);
     fclose(out_fp);
     printf("Compressed file written to %s\n", output_path);
     return EXIT_SUCCESS;
@@ -289,15 +191,14 @@ int compress_file(const char *input_path, const char *output_path)
 Function Name: decompress_file
 
 Description:
-    - Decompresses the input file: Delta decodes to packed frames,
-      then unpacks each to original 256 bytes.
+    - Decompresses the input VDX file and writes the decompressed data to the output file.
 
 Parameters:
     - input_path: The path to the input compressed file.
-    - output_path: The path to the output .token.npy file.
+    - output_path: The path to the output VDX file.
 
 Return:
-    - 0 on success, or EXIT_FAILURE on failure.
+    - 0 on success, or a negative error code on failure.
 ===============================================================================
 */
 int decompress_file(const char *input_path, const char *output_path)
@@ -330,22 +231,22 @@ int decompress_file(const char *input_path, const char *output_path)
     }
     fclose(in_fp);
 
-    // Allocate packed output buffer
-    uint8_t *packed_data = malloc(PACKED_TOTAL_DATA_SIZE);
-    if (!packed_data)
+    // Allocate output data buffer
+    uint8_t *out_data = malloc(TOTAL_DATA_SIZE);
+    if (!out_data)
     {
-        perror("Failed to allocate packed memory");
+        perror("Failed to allocate output memory");
         free(comp_data);
         return EXIT_FAILURE;
     }
 
     // Read keyframe
-    memcpy(packed_data, comp_data, PACKED_FRAME_SIZE);
-    size_t comp_pos = PACKED_FRAME_SIZE;
+    memcpy(out_data, comp_data, FRAME_SIZE);
+    size_t comp_pos = FRAME_SIZE;
 
     // Reconstruct delta frames
-    uint8_t prev_frame[PACKED_FRAME_SIZE];
-    memcpy(prev_frame, packed_data, PACKED_FRAME_SIZE);
+    uint8_t prev_frame[FRAME_SIZE];
+    memcpy(prev_frame, out_data, FRAME_SIZE);
 
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
@@ -353,7 +254,7 @@ int decompress_file(const char *input_path, const char *output_path)
         {
             fprintf(stderr, "Unexpected end of compressed data\n");
             free(comp_data);
-            free(packed_data);
+            free(out_data);
             return EXIT_FAILURE;
         }
 
@@ -361,10 +262,11 @@ int decompress_file(const char *input_path, const char *output_path)
         memcpy(mask, comp_data + comp_pos, MASK_SIZE);
         comp_pos += MASK_SIZE;
 
-        uint8_t *curr_frame = packed_data + f * PACKED_FRAME_SIZE;
-        memcpy(curr_frame, prev_frame, PACKED_FRAME_SIZE); // Start with previous frame
+        uint8_t *curr_frame = out_data + f * FRAME_SIZE;
+        memcpy(curr_frame, prev_frame, FRAME_SIZE); // Start with previous frame
 
-        for (int i = 0; i < PACKED_FRAME_SIZE; ++i)
+        int changed_idx = 0;
+        for (int i = 0; i < FRAME_SIZE; ++i)
         {
             if (mask[i / 8] & (1u << (i % 8)))
             {
@@ -372,32 +274,19 @@ int decompress_file(const char *input_path, const char *output_path)
                 {
                     fprintf(stderr, "Unexpected end of changed bytes\n");
                     free(comp_data);
-                    free(packed_data);
+                    free(out_data);
                     return EXIT_FAILURE;
                 }
                 curr_frame[i] = comp_data[comp_pos++];
+                changed_idx++;
             }
         }
 
         // Update previous frame
-        memcpy(prev_frame, curr_frame, PACKED_FRAME_SIZE);
+        memcpy(prev_frame, curr_frame, FRAME_SIZE);
     }
 
     free(comp_data);
-
-    // Unpack to original data
-    uint8_t *out_data = malloc(TOTAL_DATA_SIZE);
-    if (!out_data)
-    {
-        perror("Failed to allocate output memory");
-        free(packed_data);
-        return EXIT_FAILURE;
-    }
-    for (int f = 0; f < NUM_FRAMES; ++f)
-    {
-        unpack_frame(packed_data + f * PACKED_FRAME_SIZE, out_data + f * FRAME_SIZE);
-    }
-    free(packed_data);
 
     // Open output file
     FILE *out_fp = fopen(output_path, "wb");

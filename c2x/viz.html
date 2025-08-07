@@ -387,8 +387,9 @@
                                 byteValue = view.getInt16(byteIndex, true);
                                 textContent = byteValue.toString();
                                 normValue = Math.min(Math.max(byteValue, 0), 1023) / 1023 * 255;
+                                var binaryValue = (byteValue & 0xFFFF).toString(2).padStart(16, '0');
                                 title = 'Offset: 0x' + byteIndex.toString(16).toUpperCase() +
-                                    '\nValue: ' + byteValue;
+                                    '\nValue: ' + binaryValue;
                             }
                             var lightness = 25 + (normValue / 255) * 65;
                             hexByte.style.backgroundColor = 'hsl(270, 80%, ' + lightness + '%)';
