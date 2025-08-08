@@ -264,6 +264,19 @@ static const uint8_t numpy_header[HEADER_SIZE] = {
 
 //======================================================================
 
+// Detailed compression statistics
+typedef struct
+{
+    int dense_ops;
+    int sparse_ops;
+    int rle_ops;
+    int rle_frames;            // total frames covered by RLE repeats
+    int sparse_changes_total;  // sum of changed tokens across sparse ops
+    int dense_changes_total;   // sum of changed tokens across dense ops
+    int static_tokens;         // number of globally static tokens
+    uint32_t bitstream_bits;   // total bits of encoded opcode bitstream
+} compression_stats_t;
+
 // Thread work item structure
 typedef struct
 {
@@ -275,6 +288,9 @@ typedef struct
     uint8_t *mem_data; // optional in-memory buffer (.token.npy contents)
     size_t mem_size;   // size of in-memory buffer
     bool use_memory;   // true if mem_data should be used instead of input_path
+    char token_name[MAX_FILENAME]; // original token filename (for log/progress)
+    char log_path[MAX_FILENAME];   // per-archive log file path
+    compression_stats_t stats;     // collected statistics
 } work_item_t;
 
 // Thread pool structure
@@ -295,10 +311,13 @@ typedef struct
 
 // Global thread pool
 static thread_pool_t g_pool = {0};
+// Logging & console mutexes
+static mutex_t g_log_mutex;
+static mutex_t g_print_mutex;
 
 // Function prototypes
 void print_usage(const char *prog_name);
-int compress_file(const char *input_path, const char *output_path);
+int compress_file(const char *input_path, const char *output_path, compression_stats_t *stats);
 int decompress_file(const char *input_path, const char *output_path);
 void print_version(void);
 void pack_frame(const uint8_t *in_bytes, uint8_t *out_packed);
@@ -306,9 +325,11 @@ void unpack_frame(const uint8_t *in_packed, uint8_t *out_bytes);
 int batch_compress_archives(void);
 bool check_file_exists(const char *filename);
 int extract_and_process_archive(const char *archive_path); // legacy
-int process_tar_gz_in_memory(const char *archive_path);
-int compress_buffer(const uint8_t *data, size_t size, const char *output_path);
-void add_memory_work_item(const uint8_t *data, size_t size, const char *output_path);
+int process_tar_gz_in_memory(const char *archive_path, const char *log_path);
+static void log_stats_line(const work_item_t *work);
+static void print_progress(const char *filename);
+int compress_buffer(const uint8_t *data, size_t size, const char *output_path, compression_stats_t *stats);
+void add_memory_work_item(const uint8_t *data, size_t size, const char *output_path, const char *token_name, const char *log_path);
 THREAD_RETURN worker_thread(void *arg);
 void init_thread_pool(int max_workers);
 void cleanup_thread_pool(void);
@@ -476,7 +497,7 @@ Return:
     - 0 on success, or EXIT_FAILURE on failure.
 ===============================================================================
 */
-int compress_file(const char *input_path, const char *output_path)
+int compress_file(const char *input_path, const char *output_path, compression_stats_t *stats)
 {
     FILE *in_fp = fopen(input_path, "rb");
     FILE *out_fp = fopen(output_path, "wb");
@@ -600,6 +621,8 @@ int compress_file(const char *input_path, const char *output_path)
         return -3;
     }
     int rle_run = 0;
+    int dense_ops = 0, sparse_ops = 0, rle_ops = 0, rle_frames = 0;
+    int sparse_changes_total = 0, dense_changes_total = 0;
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
         uint8_t *curr = data + f * FRAME_SIZE;
@@ -647,6 +670,8 @@ int compress_file(const char *input_path, const char *output_path)
             {
                 bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
             }
+            sparse_ops++;
+            sparse_changes_total += changed_count;
         }
         else
         {
@@ -657,6 +682,8 @@ int compress_file(const char *input_path, const char *output_path)
             {
                 bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
             }
+            dense_ops++;
+            dense_changes_total += changed_count;
         }
         memcpy(prev_tokens, curr, FRAME_SIZE);
     }
@@ -664,12 +691,30 @@ int compress_file(const char *input_path, const char *output_path)
     {
         bw_put_bits(&bw, OPCODE_RLE, 2);
         bw_put_varint(&bw, (uint32_t)(rle_run - 1));
+        rle_ops++;
+        rle_frames += rle_run;
     }
     uint32_t bit_count = bw_finish(&bw);
     fwrite(&bit_count, 1, 4, out_fp); // store number of valid bits
     size_t stream_bytes = (bit_count + 7) / 8;
     fwrite(bw.buf, 1, stream_bytes, out_fp);
     bw_free(&bw);
+
+    if (stats)
+    {
+        int static_tokens = 0;
+        for (int t = 0; t < TOKENS_PER_FRAME; ++t)
+            if (static_mask[t / 8] & (1u << (t % 8)))
+                static_tokens++;
+        stats->dense_ops = dense_ops;
+        stats->sparse_ops = sparse_ops;
+        stats->rle_ops = rle_ops;
+        stats->rle_frames = rle_frames;
+        stats->sparse_changes_total = sparse_changes_total;
+        stats->dense_changes_total = dense_changes_total;
+        stats->static_tokens = static_tokens;
+        stats->bitstream_bits = bit_count;
+    }
 
     free(data);
     fclose(out_fp);
@@ -694,7 +739,7 @@ Return:
     - 0 on success, non‑zero on failure
 ===============================================================================
 */
-int compress_buffer(const uint8_t *data, size_t size, const char *output_path)
+int compress_buffer(const uint8_t *data, size_t size, const char *output_path, compression_stats_t *stats)
 {
     if (!data || !output_path)
         return -1;
@@ -768,6 +813,8 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path)
         return -3;
     }
     int rle_run = 0;
+    int dense_ops = 0, sparse_ops = 0, rle_ops = 0, rle_frames = 0;
+    int sparse_changes_total = 0, dense_changes_total = 0;
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
         const uint8_t *curr = frames + f * FRAME_SIZE;
@@ -810,6 +857,8 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path)
                 bw_put_bits(&bw, (uint32_t)changed_indices[i], 7);
             for (int i = 0; i < changed_count; ++i)
                 bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
+            sparse_ops++;
+            sparse_changes_total += changed_count;
         }
         else
         {
@@ -818,6 +867,8 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path)
                 bw_put_bits(&bw, local_mask[i], 8);
             for (int i = 0; i < changed_count; ++i)
                 bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
+            dense_ops++;
+            dense_changes_total += changed_count;
         }
         memcpy(prev_tokens, curr, FRAME_SIZE);
     }
@@ -825,6 +876,8 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path)
     {
         bw_put_bits(&bw, OPCODE_RLE, 2);
         bw_put_varint(&bw, (uint32_t)(rle_run - 1));
+        rle_ops++;
+        rle_frames += rle_run;
     }
     uint32_t bit_count = bw_finish(&bw);
     fwrite(&bit_count, 1, 4, out_fp);
@@ -832,6 +885,21 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path)
     fwrite(bw.buf, 1, stream_bytes, out_fp);
     bw_free(&bw);
     fclose(out_fp);
+    if (stats)
+    {
+        int static_tokens = 0;
+        for (int t = 0; t < TOKENS_PER_FRAME; ++t)
+            if (static_mask[t / 8] & (1u << (t % 8)))
+                static_tokens++;
+        stats->dense_ops = dense_ops;
+        stats->sparse_ops = sparse_ops;
+        stats->rle_ops = rle_ops;
+        stats->rle_frames = rle_frames;
+        stats->sparse_changes_total = sparse_changes_total;
+        stats->dense_changes_total = dense_changes_total;
+        stats->static_tokens = static_tokens;
+        stats->bitstream_bits = bit_count;
+    }
     return 0;
 }
 
@@ -1180,6 +1248,8 @@ void init_thread_pool(int max_workers)
     mutex_init(&g_pool.queue_mutex);
     cond_init(&g_pool.work_available);
     cond_init(&g_pool.work_complete);
+    mutex_init(&g_log_mutex);
+    mutex_init(&g_print_mutex);
 }
 
 //
@@ -1196,11 +1266,66 @@ void cleanup_thread_pool(void)
     mutex_destroy(&g_pool.queue_mutex);
     cond_destroy(&g_pool.work_available);
     cond_destroy(&g_pool.work_complete);
+    mutex_destroy(&g_log_mutex);
+    mutex_destroy(&g_print_mutex);
 }
 
 //
 // Worker thread function
 //
+static void log_stats_line(const work_item_t *work)
+{
+    if (!work->log_path[0])
+        return;
+    FILE *lf;
+    mutex_lock(&g_log_mutex);
+    lf = fopen(work->log_path, "a");
+    if (lf)
+    {
+        double ratio = work->compressed_size ? (double)work->original_size / (double)work->compressed_size : 0.0;
+        const compression_stats_t *s = &work->stats;
+        fprintf(lf,
+                "%s|orig=%zu|comp=%zu|ratio=%.3f|static=%d|bitbits=%u|dense=%d(ch=%d)|sparse=%d(ch=%d)|rle_ops=%d(rle_frames=%d)\n",
+                work->token_name[0] ? work->token_name : work->output_path,
+                work->original_size,
+                work->compressed_size,
+                ratio,
+                s->static_tokens,
+                s->bitstream_bits,
+                s->dense_ops,
+                s->dense_changes_total,
+                s->sparse_ops,
+                s->sparse_changes_total,
+                s->rle_ops,
+                s->rle_frames);
+        fclose(lf);
+    }
+    mutex_unlock(&g_log_mutex);
+}
+
+static void print_progress(const char *filename)
+{
+    mutex_lock(&g_print_mutex);
+    int completed = g_pool.completed_files;
+    int total = g_pool.total_files ? g_pool.total_files : 1;
+    float percent = (float)completed / total * 100.0f;
+    int bar_width = 50;
+    int filled = (int)(percent / 100.0f * bar_width);
+    printf("\r[");
+    for (int i = 0; i < bar_width; ++i)
+    {
+        if (i < filled)
+            putchar('=');
+        else if (i == filled)
+            putchar('>');
+        else
+            putchar(' ');
+    }
+    printf("] %d/%d (%.1f%%) %-40s", completed, total, percent, filename ? filename : "");
+    fflush(stdout);
+    mutex_unlock(&g_print_mutex);
+}
+
 THREAD_RETURN worker_thread(void *arg)
 {
     (void)arg; // Unused parameter
@@ -1221,32 +1346,34 @@ THREAD_RETURN worker_thread(void *arg)
             break;
         }
 
-        // Get work item
-        work_item_t work = g_pool.work_queue[g_pool.queue_head];
-        g_pool.queue_head = (g_pool.queue_head + 1) % g_pool.queue_size;
+    // Get work item (by pointer so we can store stats directly)
+    work_item_t *work = &g_pool.work_queue[g_pool.queue_head];
+    g_pool.queue_head = (g_pool.queue_head + 1) % g_pool.queue_size;
 
         mutex_unlock(&g_pool.queue_mutex);
 
         // Do the work
-        if (work.use_memory)
+    if (work->use_memory)
         {
-            work.result = compress_buffer(work.mem_data, work.mem_size, work.output_path);
-            if (work.mem_data)
-                free(work.mem_data);
-            work.original_size = work.mem_size;
-            work.compressed_size = get_file_size(work.output_path);
+            work->result = compress_buffer(work->mem_data, work->mem_size, work->output_path, &work->stats);
+            if (work->mem_data)
+                free(work->mem_data);
+            work->original_size = work->mem_size;
+            work->compressed_size = get_file_size(work->output_path);
         }
         else
         {
-            work.original_size = get_file_size(work.input_path);
-            work.result = compress_file(work.input_path, work.output_path);
-            work.compressed_size = get_file_size(work.output_path);
+            work->original_size = get_file_size(work->input_path);
+            work->result = compress_file(work->input_path, work->output_path, &work->stats);
+            work->compressed_size = get_file_size(work->output_path);
         }
+    log_stats_line(work);
 
         // Update progress
         mutex_lock(&g_pool.queue_mutex);
-        g_pool.completed_files++;
-        cond_signal(&g_pool.work_complete);
+    g_pool.completed_files++;
+    print_progress(work->token_name);
+    cond_signal(&g_pool.work_complete);
         mutex_unlock(&g_pool.queue_mutex);
     }
 
@@ -1280,7 +1407,7 @@ void add_work_item(const char *input_path, const char *output_path)
     mutex_unlock(&g_pool.queue_mutex);
 }
 
-void add_memory_work_item(const uint8_t *data, size_t size, const char *output_path)
+void add_memory_work_item(const uint8_t *data, size_t size, const char *output_path, const char *token_name, const char *log_path)
 {
     mutex_lock(&g_pool.queue_mutex);
     work_item_t *work = &g_pool.work_queue[g_pool.queue_tail];
@@ -1295,6 +1422,20 @@ void add_memory_work_item(const uint8_t *data, size_t size, const char *output_p
     work->mem_data = (uint8_t *)malloc(size);
     if (work->mem_data)
         memcpy(work->mem_data, data, size);
+    if (token_name)
+    {
+        strncpy(work->token_name, token_name, MAX_FILENAME - 1);
+        work->token_name[MAX_FILENAME - 1] = '\0';
+    }
+    else
+        work->token_name[0] = '\0';
+    if (log_path)
+    {
+        strncpy(work->log_path, log_path, MAX_FILENAME - 1);
+        work->log_path[MAX_FILENAME - 1] = '\0';
+    }
+    else
+        work->log_path[0] = '\0';
     g_pool.queue_tail = (g_pool.queue_tail + 1) % g_pool.queue_size;
     g_pool.total_files++;
     cond_signal(&g_pool.work_available);
@@ -1348,18 +1489,13 @@ void wait_for_completion(void)
     mutex_lock(&g_pool.queue_mutex);
 
     while (g_pool.completed_files < g_pool.total_files)
-    {
-        update_progress();
         cond_wait(&g_pool.work_complete, &g_pool.queue_mutex);
-    }
 
     mutex_unlock(&g_pool.queue_mutex);
 
     // Final progress update
-    printf("\rProgress: [");
-    for (int i = 0; i < 50; i++)
-        printf("=");
-    printf("] %d/%d (100.0%%)\n", g_pool.total_files, g_pool.total_files);
+    print_progress("done");
+    printf("\n");
 }
 
 //
@@ -1434,7 +1570,7 @@ static int make_dir(const char *path)
     return -1;
 }
 
-int process_tar_gz_in_memory(const char *archive_path)
+int process_tar_gz_in_memory(const char *archive_path, const char *log_path)
 {
     gzFile gzf = gzopen(archive_path, "rb");
     if (!gzf)
@@ -1534,7 +1670,7 @@ int process_tar_gz_in_memory(const char *archive_path)
                     }
                     char outpath[MAX_FILENAME];
                     snprintf(outpath, sizeof(outpath), "%s/%s.cmp", outdir, tar_base(fname));
-                    add_memory_work_item(buf, fsize, outpath);
+                    add_memory_work_item(buf, fsize, outpath, tar_base(fname), log_path);
                     free(buf);
                 }
             }
@@ -1594,8 +1730,8 @@ int batch_compress_archives(void)
             free(workers);
             return EXIT_FAILURE;
         }
-    process_tar_gz_in_memory("data-0000.tar.gz");
-    process_tar_gz_in_memory("data-0001.tar.gz");
+    process_tar_gz_in_memory("data-0000.tar.gz", "data-0000.log");
+    process_tar_gz_in_memory("data-0001.tar.gz", "data-0001.log");
     wait_for_completion();
     mutex_lock(&g_pool.queue_mutex);
     g_pool.shutdown = true;
@@ -1642,7 +1778,7 @@ int main(int argc, char *argv[])
         const char *input_path = argv[2];
         char output_path[256];
         snprintf(output_path, sizeof(output_path), "%s.cmp", input_path);
-        return compress_file(input_path, output_path);
+    return compress_file(input_path, output_path, NULL);
     }
     else if (strcmp(flag, "-d") == 0)
     {
