@@ -261,123 +261,164 @@ Return:
 */
 int compress_file(const char *input_path, const char *output_path)
 {
-    // Open input file
     FILE *in_fp = fopen(input_path, "rb");
-    if (!in_fp)
-    {
-        perror("Failed to open input file");
-        return EXIT_FAILURE;
-    }
+    FILE *out_fp = fopen(output_path, "wb");
+    if (!in_fp || !out_fp)
+        return -1;
 
-    // Check file size
+    // Determine input size and detect presence of NumPy header
     fseek(in_fp, 0, SEEK_END);
-    long file_size = ftell(in_fp);
-    if (file_size != TOTAL_FILE_SIZE)
+    long input_size = ftell(in_fp);
+    fseek(in_fp, 0, SEEK_SET);
+
+    long expected_with_header = HEADER_SIZE + (long)FRAME_SIZE * NUM_FRAMES;
+    long expected_no_header = (long)FRAME_SIZE * NUM_FRAMES;
+    bool has_header = false;
+    if (input_size == expected_with_header)
     {
-        fprintf(stderr, "Invalid file size: expected %d, got %ld\n", TOTAL_FILE_SIZE, file_size);
-        fclose(in_fp);
-        return EXIT_FAILURE;
+        has_header = true;
     }
-    rewind(in_fp);
+    else if (input_size == expected_no_header)
+    {
+        has_header = false;
+    }
+    else
+    {
+        // Size mismatch – refuse to proceed
+        fprintf(stderr, "compress_file: unexpected input size %ld (expected %ld or %ld)\n", input_size, expected_with_header, expected_no_header);
+        fclose(in_fp);
+        fclose(out_fp);
+        return -2;
+    }
 
-    // Skip header
-    fseek(in_fp, HEADER_SIZE, SEEK_SET);
+    if (has_header)
+    {
+        // Skip NumPy header
+        if (fseek(in_fp, HEADER_SIZE, SEEK_SET) != 0)
+        {
+            fclose(in_fp);
+            fclose(out_fp);
+            return -2;
+        }
+    }
 
-    // Read all data into memory
-    uint8_t *data = malloc(TOTAL_DATA_SIZE);
+    // Load token data into memory (always FRAME_SIZE * NUM_FRAMES bytes)
+    size_t data_bytes = FRAME_SIZE * NUM_FRAMES;
+    uint8_t *data = malloc(data_bytes);
     if (!data)
     {
-        perror("Failed to allocate memory");
         fclose(in_fp);
-        return EXIT_FAILURE;
+        fclose(out_fp);
+        return -2;
     }
-    if (fread(data, 1, TOTAL_DATA_SIZE, in_fp) != TOTAL_DATA_SIZE)
+    size_t read_count = fread(data, 1, data_bytes, in_fp);
+    if (read_count != data_bytes)
     {
-        perror("Failed to read data");
+        fprintf(stderr, "compress_file: short read (%zu vs %zu)\n", read_count, data_bytes);
         free(data);
         fclose(in_fp);
-        return EXIT_FAILURE;
+        fclose(out_fp);
+        return -2;
     }
     fclose(in_fp);
 
-    // Pack only the keyframe
+    uint8_t prev_tokens[FRAME_SIZE];
+    uint8_t mask[MASK_SIZE];
+    uint8_t changed_packed[FRAME_SIZE]; // Enough buffer for deltas
+
+    // New arrays for static token detection
+    uint8_t static_mask[MASK_SIZE] = {0};
+    uint8_t static_values[FRAME_SIZE] = {0};
+
+    // Write keyframe packed
     uint8_t key_packed[PACKED_FRAME_SIZE];
     pack_frame(data, key_packed);
+    fwrite(key_packed, 1, PACKED_FRAME_SIZE, out_fp);
 
-    // Open output file
-    FILE *out_fp = fopen(output_path, "wb");
-    if (!out_fp)
+    // Compute static tokens across all frames
+    uint8_t *first_frame = data;
+    for (int t = 0; t < TOKENS_PER_FRAME; ++t)
     {
-        perror("Failed to open output file");
-        free(data);
-        return EXIT_FAILURE;
+        bool is_static = true;
+        uint16_t first_val = first_frame[2 * t] | (first_frame[2 * t + 1] << 8);
+        first_val &= 0x3FF;
+        for (int f = 1; f < NUM_FRAMES; ++f)
+        {
+            uint8_t *frame = data + f * FRAME_SIZE;
+            uint16_t v = frame[2 * t] | (frame[2 * t + 1] << 8);
+            if ((v & 0x3FF) != first_val)
+            {
+                is_static = false;
+                break;
+            }
+        }
+        if (is_static)
+        {
+            static_mask[t / 8] |= (1u << (t % 8));
+            static_values[2 * t] = first_frame[2 * t];
+            static_values[2 * t + 1] = first_frame[2 * t + 1];
+        }
     }
 
-    // Write keyframe
-    if (fwrite(key_packed, 1, PACKED_FRAME_SIZE, out_fp) != PACKED_FRAME_SIZE)
+    // Write static mask
+    fwrite(static_mask, 1, MASK_SIZE, out_fp);
+
+    // Write static token values (in token order)
+    for (int t = 0; t < TOKENS_PER_FRAME; ++t)
     {
-        perror("Failed to write keyframe");
-        free(data);
-        fclose(out_fp);
-        return EXIT_FAILURE;
+        if (static_mask[t / 8] & (1u << (t % 8)))
+        {
+            fwrite(&static_values[2 * t], 1, 2, out_fp);
+        }
     }
 
-    // Delta frames at token level
-    uint8_t prev_tokens[FRAME_SIZE];
-    memcpy(prev_tokens, data, FRAME_SIZE);
+    // Prepare for delta frames - previous tokens = first frame
+    memcpy(prev_tokens, first_frame, FRAME_SIZE);
 
+    // Write deltas for dynamic tokens only
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
-        uint8_t *curr_tokens = data + f * FRAME_SIZE;
-        uint8_t mask[MASK_SIZE] = {0};
-        uint8_t changed_packed[PACKED_FRAME_SIZE] = {0};
+        uint8_t *curr = data + f * FRAME_SIZE;
+        memset(mask, 0, MASK_SIZE);
+        memset(changed_packed, 0, sizeof(changed_packed));
+
         int bit_pos = 0;
         for (int t = 0; t < TOKENS_PER_FRAME; ++t)
         {
-            uint16_t curr_val = curr_tokens[2 * t] | (curr_tokens[2 * t + 1] << 8);
-            curr_val &= 0x3FF;
-            uint16_t prev_val = prev_tokens[2 * t] | (prev_tokens[2 * t + 1] << 8);
-            prev_val &= 0x3FF;
+            bool is_static = (static_mask[t / 8] >> (t % 8)) & 1;
+            if (is_static)
+                continue;
+
+            uint16_t curr_val = (curr[2 * t] | (curr[2 * t + 1] << 8)) & 0x3FF;
+            uint16_t prev_val = (prev_tokens[2 * t] | (prev_tokens[2 * t + 1] << 8)) & 0x3FF;
+
             if (curr_val != prev_val)
             {
                 mask[t / 8] |= (1u << (t % 8));
                 int byte_idx = bit_pos / 8;
-                int bit_off = bit_pos % 8;
-                changed_packed[byte_idx] |= (curr_val << bit_off) & 0xFF;
-                changed_packed[byte_idx + 1] |= (curr_val >> (8 - bit_off)) & 0xFF;
-                if (bit_off > 6)
-                    changed_packed[byte_idx + 2] |= (curr_val >> (16 - bit_off)) & 0xFF;
+                int bit_offset = bit_pos % 8;
+
+                // Pack 10 bits into changed_packed at bit_offset
+                changed_packed[byte_idx] |= (curr_val << bit_offset) & 0xFF;
+                changed_packed[byte_idx + 1] |= (curr_val >> (8 - bit_offset)) & 0xFF;
+                if (bit_offset > 6)
+                {
+                    changed_packed[byte_idx + 2] |= (curr_val >> (16 - bit_offset)) & 0xFF;
+                }
                 bit_pos += BITS_PER_TOKEN;
             }
         }
-        size_t packed_len = (bit_pos + 7) / 8;
 
-        // Write mask
-        if (fwrite(mask, 1, MASK_SIZE, out_fp) != MASK_SIZE)
-        {
-            perror("Failed to write mask");
-            free(data);
-            fclose(out_fp);
-            return EXIT_FAILURE;
-        }
+        size_t len = (bit_pos + 7) / 8;
+        fwrite(mask, 1, MASK_SIZE, out_fp);
+        fwrite(changed_packed, 1, len, out_fp);
 
-        // Write changed packed
-        if (fwrite(changed_packed, 1, packed_len, out_fp) != packed_len)
-        {
-            perror("Failed to write changed bytes");
-            free(data);
-            fclose(out_fp);
-            return EXIT_FAILURE;
-        }
-
-        // Update prev
-        memcpy(prev_tokens, curr_tokens, FRAME_SIZE);
+        memcpy(prev_tokens, curr, FRAME_SIZE);
     }
 
     free(data);
     fclose(out_fp);
-    printf("Compressed file written to %s\n", output_path);
-    return EXIT_SUCCESS;
+    return 0;
 }
 
 /*
@@ -398,134 +439,107 @@ Return:
 */
 int decompress_file(const char *input_path, const char *output_path)
 {
-    // Open input file
     FILE *in_fp = fopen(input_path, "rb");
-    if (!in_fp)
-    {
-        perror("Failed to open input file");
-        return EXIT_FAILURE;
-    }
+    FILE *out_fp = fopen(output_path, "wb");
+    if (!in_fp || !out_fp)
+        return -1;
 
-    // Read entire compressed data into memory
+    // Load entire compressed file to memory for easy random access
     fseek(in_fp, 0, SEEK_END);
-    long comp_size = ftell(in_fp);
-    rewind(in_fp);
-    uint8_t *comp_data = malloc(comp_size);
+    long file_size = ftell(in_fp);
+    fseek(in_fp, 0, SEEK_SET);
+
+    uint8_t *comp_data = malloc(file_size);
     if (!comp_data)
-    {
-        perror("Failed to allocate memory");
-        fclose(in_fp);
-        return EXIT_FAILURE;
-    }
-    if (fread(comp_data, 1, comp_size, in_fp) != (size_t)comp_size)
-    {
-        perror("Failed to read compressed data");
-        free(comp_data);
-        fclose(in_fp);
-        return EXIT_FAILURE;
-    }
+        return -2;
+    fread(comp_data, 1, file_size, in_fp);
     fclose(in_fp);
 
-    // Allocate final unpacked data
-    uint8_t *out_data = malloc(TOTAL_DATA_SIZE);
+    uint8_t *out_data = malloc(FRAME_SIZE * NUM_FRAMES);
     if (!out_data)
     {
-        perror("Failed to allocate output memory");
         free(comp_data);
-        return EXIT_FAILURE;
+        return -3;
     }
 
-    // Read and unpack keyframe
-    uint8_t key_packed[PACKED_FRAME_SIZE];
-    memcpy(key_packed, comp_data, PACKED_FRAME_SIZE);
-    unpack_frame(key_packed, out_data);
-    size_t comp_pos = PACKED_FRAME_SIZE;
+    uint8_t prev_frame[FRAME_SIZE];
+    uint8_t curr_frame[FRAME_SIZE];
+    uint8_t mask[MASK_SIZE];
+    uint8_t static_mask[MASK_SIZE] = {0};
 
+    size_t comp_pos = 0;
+
+    // Read keyframe packed and unpack it (use your unpack_frame)
+    unpack_frame(comp_data + comp_pos, out_data);
+    comp_pos += PACKED_FRAME_SIZE;
+
+    memcpy(prev_frame, out_data, FRAME_SIZE);
+
+    // Read static mask
+    memcpy(static_mask, comp_data + comp_pos, MASK_SIZE);
+    comp_pos += MASK_SIZE;
+
+    // Read static values
+    for (int t = 0; t < TOKENS_PER_FRAME; ++t)
+    {
+        if (static_mask[t / 8] & (1u << (t % 8)))
+        {
+            out_data[2 * t] = comp_data[comp_pos++];
+            out_data[2 * t + 1] = comp_data[comp_pos++];
+        }
+    }
+
+    memcpy(prev_frame, out_data, FRAME_SIZE);
+
+    // Decode delta frames for dynamic tokens only
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
-        if (comp_pos + MASK_SIZE > (size_t)comp_size)
-        {
-            fprintf(stderr, "Unexpected end of compressed data\n");
-            free(comp_data);
-            free(out_data);
-            return EXIT_FAILURE;
-        }
-
-        uint8_t mask[MASK_SIZE];
         memcpy(mask, comp_data + comp_pos, MASK_SIZE);
         comp_pos += MASK_SIZE;
 
-        int num_changed = count_changed(mask);
-        size_t packed_len = ((size_t)num_changed * BITS_PER_TOKEN + 7) / 8;
+        int changed_count = count_changed(mask);
+        size_t len = (changed_count * BITS_PER_TOKEN + 7) / 8;
 
-        if (comp_pos + packed_len > (size_t)comp_size)
-        {
-            fprintf(stderr, "Unexpected end of changed bytes\n");
-            free(comp_data);
-            free(out_data);
-            return EXIT_FAILURE;
-        }
+        uint8_t *packed = comp_data + comp_pos;
+        comp_pos += len;
 
-        uint8_t *changed_packed = comp_data + comp_pos;
-        comp_pos += packed_len;
-
-        uint8_t *curr_frame = out_data + f * FRAME_SIZE;
-        uint8_t *prev_frame = out_data + (f - 1) * FRAME_SIZE;
         memcpy(curr_frame, prev_frame, FRAME_SIZE);
 
         int bit_pos = 0;
         for (int t = 0; t < TOKENS_PER_FRAME; ++t)
         {
+            if ((static_mask[t / 8] >> (t % 8)) & 1)
+            {
+                // static token, already set
+                continue;
+            }
             if (mask[t / 8] & (1u << (t % 8)))
             {
                 int byte_idx = bit_pos / 8;
-                int bit_off = bit_pos % 8;
-                uint16_t val = 0;
-                val |= (changed_packed[byte_idx] >> bit_off);
-                val |= (changed_packed[byte_idx + 1] << (8 - bit_off));
-                if (bit_off > 6)
-                    val |= (changed_packed[byte_idx + 2] << (16 - bit_off));
+                int bit_offset = bit_pos % 8;
+                uint32_t val = (packed[byte_idx] >> bit_offset) | (packed[byte_idx + 1] << (8 - bit_offset));
+                if (bit_offset > 6)
+                {
+                    val |= (packed[byte_idx + 2] << (16 - bit_offset));
+                }
                 val &= 0x3FF;
                 curr_frame[2 * t] = val & 0xFF;
                 curr_frame[2 * t + 1] = val >> 8;
                 bit_pos += BITS_PER_TOKEN;
             }
         }
+
+        memcpy(prev_frame, curr_frame, FRAME_SIZE);
+        memcpy(out_data + f * FRAME_SIZE, curr_frame, FRAME_SIZE);
     }
 
-    free(comp_data);
-
-    // Open output file
-    FILE *out_fp = fopen(output_path, "wb");
-    if (!out_fp)
-    {
-        perror("Failed to open output file");
-        free(out_data);
-        return EXIT_FAILURE;
-    }
-
-    // Write static NumPy header
-    if (fwrite(numpy_header, 1, HEADER_SIZE, out_fp) != HEADER_SIZE)
-    {
-        perror("Failed to write header");
-        free(out_data);
-        fclose(out_fp);
-        return EXIT_FAILURE;
-    }
-
-    // Write reconstructed data
-    if (fwrite(out_data, 1, TOTAL_DATA_SIZE, out_fp) != TOTAL_DATA_SIZE)
-    {
-        perror("Failed to write data");
-        free(out_data);
-        fclose(out_fp);
-        return EXIT_FAILURE;
-    }
-
+    // Prepend NumPy header so output is a valid .npy file
+    fwrite(numpy_header, 1, HEADER_SIZE, out_fp);
+    fwrite(out_data, 1, FRAME_SIZE * NUM_FRAMES, out_fp);
     free(out_data);
+    free(comp_data);
     fclose(out_fp);
-    printf("Decompressed file written to %s\n", output_path);
-    return EXIT_SUCCESS;
+    return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////
