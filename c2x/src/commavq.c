@@ -270,11 +270,12 @@ typedef struct
     int dense_ops;
     int sparse_ops;
     int rle_ops;
-    int rle_frames;            // total frames covered by RLE repeats
-    int sparse_changes_total;  // sum of changed tokens across sparse ops
-    int dense_changes_total;   // sum of changed tokens across dense ops
-    int static_tokens;         // number of globally static tokens
-    uint32_t bitstream_bits;   // total bits of encoded opcode bitstream
+    int rle_frames;           // total frames covered by RLE repeats
+    int sparse_changes_total; // sum of changed tokens across sparse ops
+    int dense_changes_total;  // sum of changed tokens across dense ops
+    int static_tokens;        // number of globally static tokens
+    uint32_t bitstream_bits;  // total bits of encoded opcode bitstream
+    int small_delta_changes;  // number of value changes encoded with small-delta form
 } compression_stats_t;
 
 // Thread work item structure
@@ -285,9 +286,9 @@ typedef struct
     size_t original_size;
     size_t compressed_size;
     int result;
-    uint8_t *mem_data; // optional in-memory buffer (.token.npy contents)
-    size_t mem_size;   // size of in-memory buffer
-    bool use_memory;   // true if mem_data should be used instead of input_path
+    uint8_t *mem_data;             // optional in-memory buffer (.token.npy contents)
+    size_t mem_size;               // size of in-memory buffer
+    bool use_memory;               // true if mem_data should be used instead of input_path
     char token_name[MAX_FILENAME]; // original token filename (for log/progress)
     char log_path[MAX_FILENAME];   // per-archive log file path
     compression_stats_t stats;     // collected statistics
@@ -303,6 +304,7 @@ typedef struct
     int active_workers;
     int total_files;
     int completed_files;
+    int expected_files; // pre-counted total .token.npy files across all archives
     mutex_t queue_mutex;
     cond_t work_available;
     cond_t work_complete;
@@ -611,6 +613,34 @@ int compress_file(const char *input_path, const char *output_path, compression_s
     // Prepare for delta frames - previous tokens = first frame
     memcpy(prev_tokens, first_frame, FRAME_SIZE);
 
+    // Pre-scan to decide whether to enable small-delta coding
+    int scan_small = 0, scan_total = 0;
+    for (int f = 1; f < NUM_FRAMES; ++f)
+    {
+        uint8_t *curr = data + f * FRAME_SIZE;
+        for (int t = 0; t < TOKENS_PER_FRAME; ++t)
+        {
+            if ((static_mask[t / 8] >> (t % 8)) & 1)
+                continue;
+            uint16_t pv = (prev_tokens[2 * t] | (prev_tokens[2 * t + 1] << 8)) & 0x3FF;
+            uint16_t cv = (curr[2 * t] | (curr[2 * t + 1] << 8)) & 0x3FF;
+            if (cv != pv)
+            {
+                int diff = (int)cv - (int)pv;
+                if (diff > 511)
+                    diff -= 1024;
+                else if (diff < -512)
+                    diff += 1024;
+                if (diff >= -31 && diff <= 31)
+                    scan_small++;
+                scan_total++;
+            }
+        }
+        memcpy(prev_tokens, curr, FRAME_SIZE);
+    }
+    bool use_delta = (scan_total > 0 && scan_small * 4 > scan_total); // >25% small
+    memcpy(prev_tokens, first_frame, FRAME_SIZE);                     // reset for real encode
+
     // Build unified opcode bitstream for remaining frames
     bit_writer_t bw;
     bw_init(&bw, 64 * 1024); // initial cap
@@ -620,14 +650,19 @@ int compress_file(const char *input_path, const char *output_path, compression_s
         fclose(out_fp);
         return -3;
     }
+    // Feature flags (bit0 = small-delta coding used)
+    uint8_t feature_flags = use_delta ? 0x01 : 0x00;
+    fwrite(&feature_flags, 1, 1, out_fp);
     int rle_run = 0;
     int dense_ops = 0, sparse_ops = 0, rle_ops = 0, rle_frames = 0;
     int sparse_changes_total = 0, dense_changes_total = 0;
+    int small_delta_changes = 0;
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
         uint8_t *curr = data + f * FRAME_SIZE;
         int changed_indices[128];
         uint16_t changed_values[128];
+        int changed_is_small[128];
         int changed_count = 0;
         uint8_t local_mask[MASK_SIZE];
         memset(local_mask, 0, MASK_SIZE);
@@ -642,6 +677,7 @@ int compress_file(const char *input_path, const char *output_path, compression_s
                 local_mask[t / 8] |= (1u << (t % 8));
                 changed_indices[changed_count] = t;
                 changed_values[changed_count] = cv;
+                changed_is_small[changed_count] = 0;
                 changed_count++;
             }
         }
@@ -658,17 +694,74 @@ int compress_file(const char *input_path, const char *output_path, compression_s
             bw_put_varint(&bw, (uint32_t)(rle_run - 1));
             rle_run = 0;
         }
-        if (changed_count <= SPARSE_THRESHOLD)
+        // Decide sparse vs dense adaptively
+        int value_bits_total = 0;
+        if (use_delta)
+        {
+            for (int i = 0; i < changed_count; ++i)
+            {
+                int t = changed_indices[i];
+                uint16_t pv = (prev_tokens[2 * t] | (prev_tokens[2 * t + 1] << 8)) & 0x3FF;
+                uint16_t cv = changed_values[i];
+                int diff = (int)cv - (int)pv;
+                if (diff > 511)
+                    diff -= 1024;
+                else if (diff < -512)
+                    diff += 1024;
+                if (diff >= -31 && diff <= 31)
+                {
+                    changed_is_small[i] = 1; // 1+1+5 =7 bits
+                    value_bits_total += 7;
+                }
+                else
+                {
+                    changed_is_small[i] = 0; // 1+10 =11 bits
+                    value_bits_total += 11;
+                }
+            }
+        }
+        else
+        {
+            value_bits_total = 10 * changed_count;
+        }
+        int dense_bits = 2 + 128 + value_bits_total;
+        int sparse_bits = (changed_count <= 32) ? (2 + 5 + 7 * changed_count + value_bits_total) : 1 << 30;
+        bool use_sparse = sparse_bits < dense_bits;
+        if (use_sparse)
         {
             bw_put_bits(&bw, OPCODE_SPARSE, 2);
-            bw_put_bits(&bw, (uint32_t)(changed_count - 1), 5); // count-1 (supports up to 32)
+            bw_put_bits(&bw, (uint32_t)(changed_count - 1), 5);
             for (int i = 0; i < changed_count; ++i)
-            {
                 bw_put_bits(&bw, (uint32_t)changed_indices[i], 7);
-            }
             for (int i = 0; i < changed_count; ++i)
             {
-                bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
+                uint16_t cv = changed_values[i];
+                if (use_delta)
+                {
+                    if (changed_is_small[i])
+                    {
+                        bw_put_bits(&bw, 0u, 1); // small
+                        uint16_t pv = (prev_tokens[2 * changed_indices[i]] | (prev_tokens[2 * changed_indices[i] + 1] << 8)) & 0x3FF;
+                        int diff = (int)cv - (int)pv;
+                        if (diff > 511)
+                            diff -= 1024;
+                        else if (diff < -512)
+                            diff += 1024;
+                        uint16_t mag = (uint16_t)(diff < 0 ? -diff : diff);
+                        bw_put_bits(&bw, diff < 0 ? 1u : 0u, 1);
+                        bw_put_bits(&bw, mag & 0x1F, 5);
+                        small_delta_changes++;
+                    }
+                    else
+                    {
+                        bw_put_bits(&bw, 1u, 1); // raw flag
+                        bw_put_bits(&bw, cv & 0x3FF, 10);
+                    }
+                }
+                else
+                {
+                    bw_put_bits(&bw, cv & 0x3FF, 10);
+                }
             }
             sparse_ops++;
             sparse_changes_total += changed_count;
@@ -680,7 +773,33 @@ int compress_file(const char *input_path, const char *output_path, compression_s
                 bw_put_bits(&bw, local_mask[i], 8);
             for (int i = 0; i < changed_count; ++i)
             {
-                bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
+                uint16_t cv = changed_values[i];
+                if (use_delta)
+                {
+                    if (changed_is_small[i])
+                    {
+                        bw_put_bits(&bw, 0u, 1);
+                        uint16_t pv = (prev_tokens[2 * changed_indices[i]] | (prev_tokens[2 * changed_indices[i] + 1] << 8)) & 0x3FF;
+                        int diff = (int)cv - (int)pv;
+                        if (diff > 511)
+                            diff -= 1024;
+                        else if (diff < -512)
+                            diff += 1024;
+                        uint16_t mag = (uint16_t)(diff < 0 ? -diff : diff);
+                        bw_put_bits(&bw, diff < 0 ? 1u : 0u, 1);
+                        bw_put_bits(&bw, mag & 0x1F, 5);
+                        small_delta_changes++;
+                    }
+                    else
+                    {
+                        bw_put_bits(&bw, 1u, 1);
+                        bw_put_bits(&bw, cv & 0x3FF, 10);
+                    }
+                }
+                else
+                {
+                    bw_put_bits(&bw, cv & 0x3FF, 10);
+                }
             }
             dense_ops++;
             dense_changes_total += changed_count;
@@ -714,6 +833,7 @@ int compress_file(const char *input_path, const char *output_path, compression_s
         stats->dense_changes_total = dense_changes_total;
         stats->static_tokens = static_tokens;
         stats->bitstream_bits = bit_count;
+        stats->small_delta_changes = use_delta ? small_delta_changes : 0;
     }
 
     free(data);
@@ -805,6 +925,34 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path, c
 
     memcpy(prev_tokens, first_frame, FRAME_SIZE);
 
+    // Pre-scan to decide small-delta usage
+    int scan_small = 0, scan_total = 0;
+    for (int f = 1; f < NUM_FRAMES; ++f)
+    {
+        const uint8_t *curr = frames + f * FRAME_SIZE;
+        for (int t = 0; t < TOKENS_PER_FRAME; ++t)
+        {
+            if ((static_mask[t / 8] >> (t % 8)) & 1)
+                continue;
+            uint16_t pv = (prev_tokens[2 * t] | (prev_tokens[2 * t + 1] << 8)) & 0x3FF;
+            uint16_t cv = (curr[2 * t] | (curr[2 * t + 1] << 8)) & 0x3FF;
+            if (cv != pv)
+            {
+                int diff = (int)cv - (int)pv;
+                if (diff > 511)
+                    diff -= 1024;
+                else if (diff < -512)
+                    diff += 1024;
+                if (diff >= -31 && diff <= 31)
+                    scan_small++;
+                scan_total++;
+            }
+        }
+        memcpy(prev_tokens, curr, FRAME_SIZE);
+    }
+    bool use_delta = (scan_total > 0 && scan_small * 4 > scan_total);
+    memcpy(prev_tokens, first_frame, FRAME_SIZE);
+
     bit_writer_t bw;
     bw_init(&bw, 64 * 1024);
     if (!bw.buf)
@@ -812,14 +960,19 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path, c
         fclose(out_fp);
         return -3;
     }
+    // Feature flags
+    uint8_t feature_flags = use_delta ? 0x01 : 0x00;
+    fwrite(&feature_flags, 1, 1, out_fp);
     int rle_run = 0;
     int dense_ops = 0, sparse_ops = 0, rle_ops = 0, rle_frames = 0;
     int sparse_changes_total = 0, dense_changes_total = 0;
+    int small_delta_changes = 0;
     for (int f = 1; f < NUM_FRAMES; ++f)
     {
         const uint8_t *curr = frames + f * FRAME_SIZE;
         int changed_indices[128];
         uint16_t changed_values[128];
+        int changed_is_small[128];
         int changed_count = 0;
         uint8_t local_mask[MASK_SIZE];
         memset(local_mask, 0, MASK_SIZE);
@@ -834,6 +987,7 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path, c
                 local_mask[t / 8] |= (1u << (t % 8));
                 changed_indices[changed_count] = t;
                 changed_values[changed_count] = cv;
+                changed_is_small[changed_count] = 0;
                 changed_count++;
             }
         }
@@ -849,14 +1003,74 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path, c
             bw_put_varint(&bw, (uint32_t)(rle_run - 1));
             rle_run = 0;
         }
-        if (changed_count <= SPARSE_THRESHOLD)
+        int value_bits_total = 0;
+        if (use_delta)
+        {
+            for (int i = 0; i < changed_count; ++i)
+            {
+                int t = changed_indices[i];
+                uint16_t pv = (prev_tokens[2 * t] | (prev_tokens[2 * t + 1] << 8)) & 0x3FF;
+                uint16_t cv = changed_values[i];
+                int diff = (int)cv - (int)pv;
+                if (diff > 511)
+                    diff -= 1024;
+                else if (diff < -512)
+                    diff += 1024;
+                if (diff >= -31 && diff <= 31)
+                {
+                    changed_is_small[i] = 1;
+                    value_bits_total += 7;
+                }
+                else
+                {
+                    changed_is_small[i] = 0;
+                    value_bits_total += 11;
+                }
+            }
+        }
+        else
+        {
+            value_bits_total = 10 * changed_count;
+        }
+        int dense_bits = 2 + 128 + value_bits_total;
+        int sparse_bits = (changed_count <= 32) ? (2 + 5 + 7 * changed_count + value_bits_total) : 1 << 30;
+        bool use_sparse = sparse_bits < dense_bits;
+        if (use_sparse)
         {
             bw_put_bits(&bw, OPCODE_SPARSE, 2);
             bw_put_bits(&bw, (uint32_t)(changed_count - 1), 5);
             for (int i = 0; i < changed_count; ++i)
                 bw_put_bits(&bw, (uint32_t)changed_indices[i], 7);
             for (int i = 0; i < changed_count; ++i)
-                bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
+            {
+                uint16_t cv = changed_values[i];
+                if (use_delta)
+                {
+                    if (changed_is_small[i])
+                    {
+                        bw_put_bits(&bw, 0u, 1);
+                        uint16_t pv = (prev_tokens[2 * changed_indices[i]] | (prev_tokens[2 * changed_indices[i] + 1] << 8)) & 0x3FF;
+                        int diff = (int)cv - (int)pv;
+                        if (diff > 511)
+                            diff -= 1024;
+                        else if (diff < -512)
+                            diff += 1024;
+                        uint16_t mag = (uint16_t)(diff < 0 ? -diff : diff);
+                        bw_put_bits(&bw, diff < 0 ? 1u : 0u, 1);
+                        bw_put_bits(&bw, mag & 0x1F, 5);
+                        small_delta_changes++;
+                    }
+                    else
+                    {
+                        bw_put_bits(&bw, 1u, 1);
+                        bw_put_bits(&bw, cv & 0x3FF, 10);
+                    }
+                }
+                else
+                {
+                    bw_put_bits(&bw, cv & 0x3FF, 10);
+                }
+            }
             sparse_ops++;
             sparse_changes_total += changed_count;
         }
@@ -866,7 +1080,35 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path, c
             for (int i = 0; i < MASK_SIZE; ++i)
                 bw_put_bits(&bw, local_mask[i], 8);
             for (int i = 0; i < changed_count; ++i)
-                bw_put_bits(&bw, (uint32_t)changed_values[i], 10);
+            {
+                uint16_t cv = changed_values[i];
+                if (use_delta)
+                {
+                    if (changed_is_small[i])
+                    {
+                        bw_put_bits(&bw, 0u, 1);
+                        uint16_t pv = (prev_tokens[2 * changed_indices[i]] | (prev_tokens[2 * changed_indices[i] + 1] << 8)) & 0x3FF;
+                        int diff = (int)cv - (int)pv;
+                        if (diff > 511)
+                            diff -= 1024;
+                        else if (diff < -512)
+                            diff += 1024;
+                        uint16_t mag = (uint16_t)(diff < 0 ? -diff : diff);
+                        bw_put_bits(&bw, diff < 0 ? 1u : 0u, 1);
+                        bw_put_bits(&bw, mag & 0x1F, 5);
+                        small_delta_changes++;
+                    }
+                    else
+                    {
+                        bw_put_bits(&bw, 1u, 1);
+                        bw_put_bits(&bw, cv & 0x3FF, 10);
+                    }
+                }
+                else
+                {
+                    bw_put_bits(&bw, cv & 0x3FF, 10);
+                }
+            }
             dense_ops++;
             dense_changes_total += changed_count;
         }
@@ -899,6 +1141,7 @@ int compress_buffer(const uint8_t *data, size_t size, const char *output_path, c
         stats->dense_changes_total = dense_changes_total;
         stats->static_tokens = static_tokens;
         stats->bitstream_bits = bit_count;
+        stats->small_delta_changes = use_delta ? small_delta_changes : 0;
     }
     return 0;
 }
@@ -973,6 +1216,16 @@ int decompress_file(const char *input_path, const char *output_path)
 
     memcpy(prev_frame, out_data, FRAME_SIZE);
 
+    // Feature flags (delta coding)
+    if (comp_pos + 1 > (size_t)file_size)
+    {
+        free(out_data);
+        free(comp_data);
+        fclose(out_fp);
+        return -4;
+    }
+    uint8_t feature_flags = comp_data[comp_pos++];
+    bool use_delta = (feature_flags & 0x01) != 0;
     // Read bitstream length (bits)
     if (comp_pos + 4 > (size_t)file_size)
     {
@@ -1018,12 +1271,50 @@ int decompress_file(const char *input_path, const char *output_path)
             for (uint32_t i = 0; i < count; ++i)
             {
                 int t = indices[i];
-                if ((static_mask[t / 8] >> (t % 8)) & 1)
+                if ((static_mask[t / 8] >> (t % 8)) & 1) // should not happen (we skip static during encode)
                 {
-                    (void)br_get_bits(&br, 10);
+                    if (use_delta)
+                    {
+                        uint32_t flag = br_get_bits(&br, 1);
+                        if (flag == 0)
+                        {
+                            (void)br_get_bits(&br, 1);
+                            (void)br_get_bits(&br, 5);
+                        }
+                        else
+                        {
+                            (void)br_get_bits(&br, 10);
+                        }
+                    }
+                    else
+                    {
+                        (void)br_get_bits(&br, 10);
+                    }
                     continue;
                 }
-                uint16_t v = (uint16_t)br_get_bits(&br, 10);
+                uint16_t v;
+                if (use_delta)
+                {
+                    uint32_t flag = br_get_bits(&br, 1);
+                    if (flag == 0)
+                    {
+                        uint32_t sign = br_get_bits(&br, 1);
+                        uint32_t mag = br_get_bits(&br, 5);
+                        int diff = (int)mag;
+                        if (sign)
+                            diff = -diff;
+                        uint16_t pv = (prev_frame[2 * t] | (prev_frame[2 * t + 1] << 8)) & 0x3FF;
+                        v = (uint16_t)((pv + diff) & 0x3FF);
+                    }
+                    else
+                    {
+                        v = (uint16_t)br_get_bits(&br, 10);
+                    }
+                }
+                else
+                {
+                    v = (uint16_t)br_get_bits(&br, 10);
+                }
                 curr_frame[2 * t] = v & 0xFF;
                 curr_frame[2 * t + 1] = (v >> 8) & 0xFF;
             }
@@ -1043,7 +1334,29 @@ int decompress_file(const char *input_path, const char *output_path)
                     continue;
                 if (local_mask[t / 8] & (1u << (t % 8)))
                 {
-                    uint16_t v = (uint16_t)br_get_bits(&br, 10);
+                    uint16_t v;
+                    if (use_delta)
+                    {
+                        uint32_t flag = br_get_bits(&br, 1);
+                        if (flag == 0)
+                        {
+                            uint32_t sign = br_get_bits(&br, 1);
+                            uint32_t mag = br_get_bits(&br, 5);
+                            int diff = (int)mag;
+                            if (sign)
+                                diff = -diff;
+                            uint16_t pv = (prev_frame[2 * t] | (prev_frame[2 * t + 1] << 8)) & 0x3FF;
+                            v = (uint16_t)((pv + diff) & 0x3FF);
+                        }
+                        else
+                        {
+                            v = (uint16_t)br_get_bits(&br, 10);
+                        }
+                    }
+                    else
+                    {
+                        v = (uint16_t)br_get_bits(&br, 10);
+                    }
                     curr_frame[2 * t] = v & 0xFF;
                     curr_frame[2 * t + 1] = (v >> 8) & 0xFF;
                 }
@@ -1243,6 +1556,7 @@ void init_thread_pool(int max_workers)
     g_pool.active_workers = max_workers;
     g_pool.total_files = 0;
     g_pool.completed_files = 0;
+    g_pool.expected_files = 0;
     g_pool.shutdown = false;
 
     mutex_init(&g_pool.queue_mutex);
@@ -1285,7 +1599,7 @@ static void log_stats_line(const work_item_t *work)
         double ratio = work->compressed_size ? (double)work->original_size / (double)work->compressed_size : 0.0;
         const compression_stats_t *s = &work->stats;
         fprintf(lf,
-                "%s|orig=%zu|comp=%zu|ratio=%.3f|static=%d|bitbits=%u|dense=%d(ch=%d)|sparse=%d(ch=%d)|rle_ops=%d(rle_frames=%d)\n",
+                "%s|orig=%zu|comp=%zu|ratio=%.3f|static=%d|bitbits=%u|dense=%d(ch=%d)|sparse=%d(ch=%d)|rle_ops=%d(rle_frames=%d)|small=%d\n",
                 work->token_name[0] ? work->token_name : work->output_path,
                 work->original_size,
                 work->compressed_size,
@@ -1297,7 +1611,8 @@ static void log_stats_line(const work_item_t *work)
                 s->sparse_ops,
                 s->sparse_changes_total,
                 s->rle_ops,
-                s->rle_frames);
+                s->rle_frames,
+                s->small_delta_changes);
         fclose(lf);
     }
     mutex_unlock(&g_log_mutex);
@@ -1307,7 +1622,7 @@ static void print_progress(const char *filename)
 {
     mutex_lock(&g_print_mutex);
     int completed = g_pool.completed_files;
-    int total = g_pool.total_files ? g_pool.total_files : 1;
+    int total = g_pool.expected_files > 0 ? g_pool.expected_files : (g_pool.total_files ? g_pool.total_files : 1);
     float percent = (float)completed / total * 100.0f;
     int bar_width = 50;
     int filled = (int)(percent / 100.0f * bar_width);
@@ -1346,14 +1661,14 @@ THREAD_RETURN worker_thread(void *arg)
             break;
         }
 
-    // Get work item (by pointer so we can store stats directly)
-    work_item_t *work = &g_pool.work_queue[g_pool.queue_head];
-    g_pool.queue_head = (g_pool.queue_head + 1) % g_pool.queue_size;
+        // Get work item (by pointer so we can store stats directly)
+        work_item_t *work = &g_pool.work_queue[g_pool.queue_head];
+        g_pool.queue_head = (g_pool.queue_head + 1) % g_pool.queue_size;
 
         mutex_unlock(&g_pool.queue_mutex);
 
         // Do the work
-    if (work->use_memory)
+        if (work->use_memory)
         {
             work->result = compress_buffer(work->mem_data, work->mem_size, work->output_path, &work->stats);
             if (work->mem_data)
@@ -1367,13 +1682,13 @@ THREAD_RETURN worker_thread(void *arg)
             work->result = compress_file(work->input_path, work->output_path, &work->stats);
             work->compressed_size = get_file_size(work->output_path);
         }
-    log_stats_line(work);
+        log_stats_line(work);
 
         // Update progress
         mutex_lock(&g_pool.queue_mutex);
-    g_pool.completed_files++;
-    print_progress(work->token_name);
-    cond_signal(&g_pool.work_complete);
+        g_pool.completed_files++;
+        print_progress(work->token_name);
+        cond_signal(&g_pool.work_complete);
         mutex_unlock(&g_pool.queue_mutex);
     }
 
@@ -1454,7 +1769,7 @@ void update_progress(void)
     { // Update every second
         mutex_lock(&g_pool.queue_mutex);
         int completed = g_pool.completed_files;
-        int total = g_pool.total_files;
+        int total = g_pool.expected_files > 0 ? g_pool.expected_files : g_pool.total_files;
         mutex_unlock(&g_pool.queue_mutex);
 
         if (total > 0)
@@ -1706,6 +2021,63 @@ int process_tar_gz_in_memory(const char *archive_path, const char *log_path)
     return EXIT_SUCCESS;
 }
 
+// Count valid .token.npy files inside a tar.gz to drive accurate overall progress display
+static int count_token_files_in_tar_gz(const char *archive_path)
+{
+    gzFile gzf = gzopen(archive_path, "rb");
+    if (!gzf)
+        return -1;
+    const size_t BLK = 512;
+    uint8_t hdr[512];
+    int count = 0;
+    while (1)
+    {
+        int r = gzread(gzf, hdr, BLK);
+        if (r == 0)
+            break; // EOF
+        if (r != (int)BLK)
+            break; // truncated
+        bool zero = true;
+        for (int i = 0; i < 512; ++i)
+            if (hdr[i] != 0)
+            {
+                zero = false;
+                break;
+            }
+        if (zero)
+        {
+            gzread(gzf, hdr, BLK); // second zero block
+            break;
+        }
+        tar_header_t *th = (tar_header_t *)hdr;
+        size_t fsize = tar_parse_octal(th->size, sizeof(th->size));
+        size_t aligned = ((fsize + BLK - 1) / BLK) * BLK;
+        char fname[256] = {0};
+        if (th->prefix[0])
+            snprintf(fname, sizeof(fname), "%s/%s", th->prefix, th->name);
+        else
+            snprintf(fname, sizeof(fname), "%s", th->name);
+        if ((th->typeflag == '0' || th->typeflag == '\0') && strstr(fname, ".token.npy"))
+        {
+            if (fsize == (size_t)FRAME_SIZE * NUM_FRAMES || fsize == HEADER_SIZE + (size_t)FRAME_SIZE * NUM_FRAMES)
+                count++;
+        }
+        // skip payload
+        size_t to_skip = aligned;
+        uint8_t tmp[512];
+        while (to_skip > 0)
+        {
+            size_t chunk = to_skip > BLK ? BLK : to_skip;
+            int rr = gzread(gzf, tmp, (unsigned)chunk);
+            if (rr <= 0)
+                break;
+            to_skip -= rr;
+        }
+    }
+    gzclose(gzf);
+    return count;
+}
+
 int batch_compress_archives(void)
 {
     printf("CommaVQ Batch Processor %s\n", VERSION);
@@ -1715,8 +2087,17 @@ int batch_compress_archives(void)
         fprintf(stderr, "Archives missing.\n");
         return EXIT_FAILURE;
     }
+    // Pre-count .token.npy files in both archives for accurate progress denominator
+    int count0 = count_token_files_in_tar_gz("data-0000.tar.gz");
+    int count1 = count_token_files_in_tar_gz("data-0001.tar.gz");
+    int expected_total = 0;
+    if (count0 > 0)
+        expected_total += count0;
+    if (count1 > 0)
+        expected_total += count1;
     int threads = get_cpu_count();
     init_thread_pool(threads);
+    g_pool.expected_files = expected_total; // may be 0 if counting failed, falls back to dynamic total
     thread_t *workers = malloc(sizeof(thread_t) * threads);
     if (!workers)
     {
@@ -1778,7 +2159,7 @@ int main(int argc, char *argv[])
         const char *input_path = argv[2];
         char output_path[256];
         snprintf(output_path, sizeof(output_path), "%s.cmp", input_path);
-    return compress_file(input_path, output_path, NULL);
+        return compress_file(input_path, output_path, NULL);
     }
     else if (strcmp(flag, "-d") == 0)
     {
