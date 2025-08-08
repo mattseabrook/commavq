@@ -86,7 +86,7 @@ setup_winsdk() {
 # ------------------------------------------------------------------------------
 clean() {
     echo "Cleaning build artifacts..."
-    rm -rf "$BUILD_DIR" "commavq.exe" "commavq"
+    rm -rf "$BUILD_DIR" "commavq.exe" "commavq" *.token.npy.cmp *.token.npy.cmp.dec
     echo "  ✓ Cleaned successfully"
 }
 
@@ -156,7 +156,8 @@ build_linux() {
         "${OBJECTS[@]}" \
         -o "$EXE_NAME" \
         -lm \
-        -lpthread
+        -lpthread \
+        -lz
     set +x  # Disable command tracing
 
     if [[ $? -eq 0 ]]; then
